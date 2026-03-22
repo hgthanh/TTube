@@ -5,7 +5,7 @@ import { VideoPlayer } from "@/components/video/VideoPlayer";
 import { VideoCard } from "@/components/video/VideoCard";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useVideo, useStreamUrl, useSearch } from "@/hooks/use-yt";
+import { useVideo, useStreamUrl, useSearch, useChannel } from "@/hooks/use-yt";
 import { useAuth } from "@/contexts/AuthContext";
 import { useLang } from "@/contexts/LangContext";
 import { Share2, Heart, Headphones, QrCode } from "lucide-react";
@@ -28,6 +28,7 @@ export default function VideoPage() {
   const { data: video, isLoading: loadingVideo } = useVideo(id);
   const { data: streamUrl, isLoading: loadingStream } = useStreamUrl(id);
   const { data: related } = useSearch(video?.title || "trending", "video");
+  const { data: channel } = useChannel(video?.channelId || "");
 
   // Check favorite status
   useEffect(() => {
@@ -113,14 +114,26 @@ export default function VideoPage() {
             <div className="flex items-center gap-4">
               {loadingVideo ? <Skeleton className="h-10 w-40" /> : (
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold">
-                    <Link href={`/channel/${video?.channelId}`}>{video?.channelTitle?.[0]}</Link>
-                  </div>
+                  <Link href={`/channel/${video?.channelId}`}>
+                    {channel?.thumbnail ? (
+                      <img
+                        src={channel.thumbnail}
+                        alt={video?.channelTitle}
+                        className="w-10 h-10 rounded-full object-cover ring-2 ring-primary/20"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-sm">
+                        {video?.channelTitle?.[0]}
+                      </div>
+                    )}
+                  </Link>
                   <div>
                     <Link href={`/channel/${video?.channelId}`}>
                       <h3 className="font-semibold hover:text-primary transition-colors cursor-pointer">{video?.channelTitle}</h3>
                     </Link>
-                    <p className="text-xs text-muted-foreground">{t.viewsHidden}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {channel?.subscriberCount || t.viewsHidden}
+                    </p>
                   </div>
                   <Button variant="secondary" size="sm" className="ml-4 rounded-full font-semibold">{t.subscribe}</Button>
                 </div>

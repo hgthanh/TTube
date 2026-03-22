@@ -411,7 +411,17 @@ app.get("/api/yt/search", async (req, res) => {
     if (!q) return res.status(400).json({ message: "Missing query" });
     const yt = await getYoutube();
     const results = await yt.search(q);
-    res.json(results.videos.map((v:any)=>({ id:v.id, title:v.title?.text||v.title||"", thumbnail:v.thumbnails?.[0]?.url||"", channelTitle:v.author?.name||"", channelId:v.author?.id||"", viewCount:v.view_count?.text||"", publishedTime:v.published?.text||"", lengthSeconds:String(v.duration?.seconds||0), isShort:!!v.is_short })).filter((i:any)=>i.id&&i.title));
+    res.json(results.videos.map((v:any)=>({
+      id: v.id,
+      title: v.title?.text || v.title?.content || v.title || "",
+      thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || "",
+      channelTitle: v.author?.name || v.short_byline_text?.runs?.[0]?.text || "",
+      channelId: v.author?.id || v.short_byline_text?.runs?.[0]?.endpoint?.browse_endpoint?.browse_id || "",
+      viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
+      publishedTime: v.published?.text || v.publish_date_text?.text || "",
+      lengthSeconds: String(v.duration?.seconds || 0),
+      isShort: !!v.is_short,
+    })).filter((i:any)=>i.id&&i.title));
   } catch (err:any) { console.error("Search:",err.message); invalidateSession(err.message); res.status(500).json({ message:"Search failed" }); }
 });
 
@@ -420,8 +430,59 @@ app.get("/api/yt/video/:id", async (req, res) => {
   try {
     const yt = await getYoutube();
     const info = await yt.getInfo(req.params.id);
-    res.json({ id:info.basic_info.id, title:info.basic_info.title||"", description:info.basic_info.short_description||"", thumbnail:info.basic_info.thumbnail?.[0]?.url||"", channelId:info.basic_info.channel_id||"", channelTitle:(info.basic_info as any).channel?.name||(info.basic_info as any).author||"", viewCount:info.basic_info.view_count?`${Number(info.basic_info.view_count).toLocaleString()} views`:"0 views", likeCount:info.basic_info.like_count?String(info.basic_info.like_count):"0", publishedTime:"" });
-  } catch (err:any) { console.error("Video:",err.message); invalidateSession(err.message); res.status(404).json({ message:"Video not found" }); }
+    const bi = info.basic_info as any;
+
+    // Channel name: try multiple paths used across youtubei.js versions
+    const channelTitle =
+      bi.channel?.name ||      // v16 path
+      bi.author ||              // v16 fallback
+      bi.channel_name ||        // some v17 builds
+      bi.owner?.channel_name || // v17 path
+      bi.owner?.name ||         // v17 alt
+      "";
+
+    // Channel ID: multiple fallback paths
+    const channelId =
+      bi.channel_id ||
+      bi.channel?.id ||
+      bi.owner?.id ||
+      bi.owner?.external_channel_id ||
+      "";
+
+    // Views: handle both number and pre-formatted string
+    let viewCount = "0 views";
+    if (bi.view_count != null) {
+      const n = Number(bi.view_count);
+      viewCount = isNaN(n) ? String(bi.view_count) : `${n.toLocaleString()} views`;
+    } else if (bi.short_view_count_text?.text) {
+      viewCount = bi.short_view_count_text.text;
+    }
+
+    // Thumbnail: try multiple paths
+    const thumbnail =
+      bi.thumbnail?.[0]?.url ||
+      bi.thumbnails?.[0]?.url ||
+      "";
+
+    // Like count
+    const likeCount = bi.like_count != null ? String(bi.like_count) : "0";
+
+    res.json({
+      id: bi.id || req.params.id,
+      title: bi.title || "",
+      description: bi.short_description || bi.description || "",
+      thumbnail,
+      channelId,
+      channelTitle,
+      viewCount,
+      likeCount,
+      publishedTime: bi.publish_date || bi.published_time_text?.text || "",
+    });
+  } catch (err:any) {
+    console.error("Video:",err.message);
+    invalidateSession(err.message);
+    res.status(404).json({ message:"Video not found" });
+  }
 });
 
 // ── YouTube: subtitles ────────────────────────────────────────────────────────
@@ -459,8 +520,37 @@ app.get("/api/yt/channel/:id", async (req, res) => {
   try {
     const yt = await getYoutube();
     const ch = await yt.getChannel(req.params.id);
-    res.json({ id:(ch as any).metadata?.external_id||req.params.id, title:(ch as any).metadata?.title||"", description:(ch as any).metadata?.description||"", thumbnail:(ch as any).metadata?.avatar?.[0]?.url||(ch as any).metadata?.thumbnail?.[0]?.url||"", banner:(ch as any).header?.banner?.[0]?.url||"", subscriberCount:(ch as any).metadata?.subscribers?.text||"" });
-  } catch (err:any) { console.error("Channel:",err.message); res.status(404).json({ message:"Channel not found" }); }
+    const m = (ch as any).metadata ?? {};
+    const h = (ch as any).header ?? {};
+    const thumbnail =
+      m.avatar?.[0]?.url ||
+      m.thumbnail?.[0]?.url ||
+      h.avatar?.[0]?.url ||
+      (ch as any).thumbnail?.[0]?.url ||
+      "";
+    const banner =
+      h.banner?.[0]?.url ||
+      m.banner?.[0]?.url ||
+      (ch as any).header_links?.[0]?.thumbnail?.[0]?.url ||
+      "";
+    const subscriberCount =
+      m.subscribers?.text ||
+      m.subscriber_count_text ||
+      h.subscriber_count_text?.text ||
+      (ch as any).subscriber_count?.text ||
+      "";
+    res.json({
+      id: m.external_id || m.channel_id || req.params.id,
+      title: m.title || m.display_name || "",
+      description: m.description || "",
+      thumbnail,
+      banner,
+      subscriberCount,
+    });
+  } catch (err:any) {
+    console.error("Channel:",err.message);
+    res.status(404).json({ message:"Channel not found" });
+  }
 });
 
 app.get("/api/yt/channel/:id/videos", async (req, res) => {
