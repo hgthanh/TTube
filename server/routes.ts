@@ -6,69 +6,196 @@ import { api } from "@shared/routes";
 import { z } from "zod";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 
-// ─── Proxy Pool (ProxyScrape) ─────────────────────────────────────────────────
+// ─── Proxy Pool ───────────────────────────────────────────────────────────────
 
 const PROXYSCRAPE_URL =
   "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text";
 
-let proxyPool: string[] = [];
-let proxyFetchedAt = 0;
-const PROXY_TTL_MS = 5 * 60 * 1000; // refresh every 5 min
+// Raw list fetched from ProxyScrape (for Settings display)
+let rawProxyPool: string[] = [];
+let rawFetchedAt = 0;
 
-async function refreshProxyPool(): Promise<void> {
+// Validated working proxies (tested against YouTube)
+let validatedProxies: string[] = [];
+let validationRunning = false;
+
+const PROXY_TEST_URL = "https://www.youtube.com/favicon.ico";
+const PROXY_TEST_TIMEOUT = 6_000;
+const MAX_CONCURRENT_TESTS = 15;
+const TARGET_VALIDATED = 8;
+
+/** Test one proxy — resolves true if it can reach YouTube within timeout */
+async function testProxy(proxyUrl: string): Promise<boolean> {
   try {
-    const res = await fetch(PROXYSCRAPE_URL, {
-      signal: AbortSignal.timeout(12_000),
+    const dispatcher = new ProxyAgent({
+      uri: proxyUrl,
+      connectTimeout: PROXY_TEST_TIMEOUT,
+      headersTimeout: PROXY_TEST_TIMEOUT,
     });
+    const res = await undiciFetch(PROXY_TEST_URL, {
+      method: "HEAD",
+      dispatcher,
+      signal: AbortSignal.timeout(PROXY_TEST_TIMEOUT),
+    } as any);
+    return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+/** Shuffle array in-place (Fisher-Yates) */
+function shuffle<T>(arr: T[]): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+/** Validate proxies in the background, filling validatedProxies pool */
+async function buildValidatedPool(candidates: string[]): Promise<void> {
+  if (validationRunning) return;
+  validationRunning = true;
+  console.log(`[proxy] validating up to ${candidates.length} candidates…`);
+
+  const shuffled = shuffle([...candidates]);
+  const newValid: string[] = [];
+
+  for (let i = 0; i < shuffled.length && newValid.length < TARGET_VALIDATED; i += MAX_CONCURRENT_TESTS) {
+    const batch = shuffled.slice(i, i + MAX_CONCURRENT_TESTS);
+    const results = await Promise.all(
+      batch.map(async (p) => ({ p, ok: await testProxy(p) }))
+    );
+    for (const { p, ok } of results) {
+      if (ok) {
+        newValid.push(p);
+        console.log(`[proxy] ✓ ${p}`);
+        if (newValid.length >= TARGET_VALIDATED) break;
+      }
+    }
+  }
+
+  validatedProxies = newValid;
+  validationRunning = false;
+  console.log(`[proxy] validated pool ready: ${validatedProxies.length} working proxies`);
+}
+
+async function fetchRawProxies(): Promise<void> {
+  try {
+    const res = await fetch(PROXYSCRAPE_URL, { signal: AbortSignal.timeout(12_000) });
     const text = await res.text();
-    const proxies = text
+    const list = text
       .split("\n")
       .map((p) => p.trim())
       .filter((p) => p.startsWith("http://") || p.startsWith("https://"));
-    if (proxies.length > 0) {
-      proxyPool = proxies;
-      proxyFetchedAt = Date.now();
-      console.log(`[proxy] loaded ${proxies.length} proxies from ProxyScrape`);
+    if (list.length > 0) {
+      rawProxyPool = list;
+      rawFetchedAt = Date.now();
+      console.log(`[proxy] fetched ${list.length} raw proxies from ProxyScrape`);
+      // Kick off validation in background (don't await)
+      buildValidatedPool(list).catch(console.error);
     }
   } catch (err) {
     console.error("[proxy] failed to fetch proxy list:", err);
   }
 }
 
-async function getRandomProxy(): Promise<string | null> {
-  if (!proxyPool.length || Date.now() - proxyFetchedAt > PROXY_TTL_MS) {
-    await refreshProxyPool();
-  }
-  if (!proxyPool.length) return null;
-  return proxyPool[Math.floor(Math.random() * proxyPool.length)];
+/** Get a random validated proxy. Falls back to null (direct) if pool is empty. */
+function getWorkingProxy(): string | null {
+  if (validatedProxies.length === 0) return null;
+  return validatedProxies[Math.floor(Math.random() * validatedProxies.length)];
 }
 
-// Pre-load proxy list on startup (non-blocking)
-refreshProxyPool().catch(() => {});
+/** Remove a bad proxy from the validated pool */
+function evictProxy(proxyUrl: string) {
+  validatedProxies = validatedProxies.filter((p) => p !== proxyUrl);
+  console.log(`[proxy] evicted ${proxyUrl} (${validatedProxies.length} remaining)`);
+  // Refill if pool runs low
+  if (validatedProxies.length < 3 && rawProxyPool.length > 0 && !validationRunning) {
+    buildValidatedPool(rawProxyPool).catch(console.error);
+  }
+}
+
+// Kick off on startup
+fetchRawProxies().catch(console.error);
+// Re-fetch raw list every 10 min
+setInterval(() => fetchRawProxies().catch(console.error), 10 * 60 * 1000);
+
+// ─── Build a proxyFetch function for youtubei.js ──────────────────────────────
+
+/** Wraps undici fetch with a ProxyAgent and handles Request objects */
+function makeProxyFetch(proxyUrl: string) {
+  const dispatcher = new ProxyAgent({
+    uri: proxyUrl,
+    connectTimeout: 10_000,
+    headersTimeout: 15_000,
+  });
+
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    let url: string;
+    let mergedInit: Record<string, any> = { ...(init ?? {}) };
+
+    if (typeof input === "string") {
+      url = input;
+    } else if (input instanceof URL) {
+      url = input.toString();
+    } else {
+      // Request object — extract primitives so undici can handle it
+      url = input.url;
+      mergedInit = {
+        method: input.method,
+        headers: Object.fromEntries((input.headers as any).entries?.() ?? []),
+        body: ["GET", "HEAD"].includes(input.method) ? undefined : input.body,
+        ...init,
+      };
+    }
+
+    return undiciFetch(url, { ...mergedInit, dispatcher } as any) as unknown as Promise<Response>;
+  };
+}
 
 // ─── Innertube singleton ──────────────────────────────────────────────────────
 
 let youtube: Innertube | null = null;
+let youtubeProxy: string | null = null;
 let youtubeCreatedAt = 0;
-const YOUTUBE_SESSION_TTL_MS = 30 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 60 * 1000;
 
 async function getYoutube(): Promise<Innertube> {
-  if (!youtube || Date.now() - youtubeCreatedAt > YOUTUBE_SESSION_TTL_MS) {
-    const proxyUrl = await getRandomProxy();
-    const options: any = { generate_session_locally: true };
-    if (proxyUrl) {
-      const dispatcher = new ProxyAgent(proxyUrl);
-      options.fetch = (input: any, init: any) =>
-        undiciFetch(input, { ...init, dispatcher }) as unknown as Promise<Response>;
-      console.log("[innertube] using proxy:", proxyUrl);
-    }
-    youtube = await Innertube.create(options);
-    youtubeCreatedAt = Date.now();
+  const now = Date.now();
+  if (youtube && now - youtubeCreatedAt < SESSION_TTL_MS) return youtube;
+
+  const proxyUrl = getWorkingProxy();
+  const options: any = { generate_session_locally: true };
+
+  if (proxyUrl) {
+    options.fetch = makeProxyFetch(proxyUrl);
+    console.log("[innertube] creating session via proxy:", proxyUrl);
+  } else {
+    console.log("[innertube] creating session direct (no validated proxy yet)");
   }
+
+  // Timeout guard so we don't hang forever
+  youtube = await Promise.race([
+    Innertube.create(options),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Innertube session timeout")), 20_000)
+    ),
+  ]);
+  youtubeProxy = proxyUrl;
+  youtubeCreatedAt = now;
   return youtube;
 }
 
-// ─── Stream URL cache ─────────────────────────────────────────────────────────
+function invalidateSession(reason?: string) {
+  if (reason) console.log("[innertube] invalidating session:", reason);
+  if (youtubeProxy) evictProxy(youtubeProxy);
+  youtube = null;
+  youtubeProxy = null;
+  youtubeCreatedAt = 0;
+}
+
+// ─── Stream cache ─────────────────────────────────────────────────────────────
 
 const streamUrlCache = new Map<string, { url: string; expires: number }>();
 
@@ -82,35 +209,23 @@ async function getStreamUrl(videoId: string): Promise<string> {
   if (!format) throw new Error("No suitable format found");
 
   const rawUrl = String(await format.decipher(yt.session.player));
-
-  // Wrap with our own /api/proxy endpoint (replaces the Cloudflare Worker)
   const proxiedUrl = `/api/proxy?url=${encodeURIComponent(rawUrl)}`;
 
-  streamUrlCache.set(videoId, {
-    url: proxiedUrl,
-    expires: Date.now() + 30 * 60 * 1000,
-  });
-
+  streamUrlCache.set(videoId, { url: proxiedUrl, expires: Date.now() + 30 * 60 * 1000 });
   if (streamUrlCache.size > 50) {
-    const firstKey = streamUrlCache.keys().next().value;
-    if (firstKey) streamUrlCache.delete(firstKey);
+    const first = streamUrlCache.keys().next().value;
+    if (first) streamUrlCache.delete(first);
   }
-
   return proxiedUrl;
 }
 
 const GUEST_USER_ID = 1;
 
-// ─── Route registration ───────────────────────────────────────────────────────
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
-export async function registerRoutes(
-  httpServer: Server,
-  app: Express
-): Promise<Server> {
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
 
-  // ── URL proxy pass-through ─────────────────────────────────────────────────
-  // Replaces the Cloudflare Worker at prx.thazh-app.workers.dev
-  // Handles video streams (range requests) and subtitle files
+  // ── /api/proxy — stream / subtitle pass-through ──────────────────────────
   app.get("/api/proxy", async (req, res) => {
     const targetUrl = req.query.url as string;
     if (!targetUrl) return res.status(400).send("Missing url param");
@@ -118,36 +233,39 @@ export async function registerRoutes(
     try {
       const reqHeaders: Record<string, string> = {
         "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
       };
-      if (req.headers.range) reqHeaders["range"] = req.headers.range as string;
+      if (req.headers.range) reqHeaders.range = req.headers.range as string;
 
-      const proxyUrl = await getRandomProxy();
-      let fetchResponse: Response;
+      // Try with a working proxy first; fall back to direct
+      let fetchResponse: Response | null = null;
+      const proxyUrl = getWorkingProxy();
 
       if (proxyUrl) {
-        const dispatcher = new ProxyAgent(proxyUrl);
-        fetchResponse = (await undiciFetch(targetUrl, {
+        try {
+          const dispatcher = new ProxyAgent({ uri: proxyUrl });
+          fetchResponse = (await undiciFetch(targetUrl, {
+            headers: reqHeaders,
+            dispatcher,
+            signal: AbortSignal.timeout(15_000),
+          } as any)) as unknown as Response;
+        } catch {
+          evictProxy(proxyUrl);
+          fetchResponse = null;
+        }
+      }
+
+      if (!fetchResponse) {
+        fetchResponse = await fetch(targetUrl, {
           headers: reqHeaders,
-          dispatcher,
-        } as any)) as unknown as Response;
-      } else {
-        fetchResponse = await fetch(targetUrl, { headers: reqHeaders });
+          signal: AbortSignal.timeout(15_000),
+        });
       }
 
       res.status(fetchResponse.status);
-
-      const forward = [
-        "content-type",
-        "content-length",
-        "content-range",
-        "accept-ranges",
-        "last-modified",
-        "etag",
-      ];
-      for (const h of forward) {
-        const val = fetchResponse.headers.get(h);
-        if (val) res.setHeader(h, val);
+      for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "last-modified", "etag"]) {
+        const v = fetchResponse.headers.get(h);
+        if (v) res.setHeader(h, v);
       }
       res.setHeader("access-control-allow-origin", "*");
       res.setHeader("cache-control", "public, max-age=3600");
@@ -159,39 +277,45 @@ export async function registerRoutes(
             while (true) {
               const { done, value } = await reader.read();
               if (done) { res.end(); break; }
-              const ok = res.write(Buffer.from(value));
-              if (!ok) await new Promise((r) => res.once("drain", r));
+              if (!res.write(Buffer.from(value))) await new Promise((r) => res.once("drain", r));
             }
-          } catch {
-            res.destroy();
-          }
+          } catch { res.destroy(); }
         };
         pump();
       } else {
         res.end();
       }
-    } catch (error: any) {
-      if (!res.headersSent)
-        res.status(500).json({ message: "Proxy error: " + error.message });
+    } catch (err: any) {
+      if (!res.headersSent) res.status(500).json({ message: "Proxy error: " + err.message });
     }
   });
 
-  // ── Proxy list (for Settings page) ────────────────────────────────────────
-  app.get("/api/proxies", async (_req, res) => {
-    if (!proxyPool.length || Date.now() - proxyFetchedAt > PROXY_TTL_MS) {
-      await refreshProxyPool();
-    }
-    res.json({ proxies: proxyPool, fetchedAt: proxyFetchedAt, total: proxyPool.length });
+  // ── /api/proxies — list for Settings page ────────────────────────────────
+  app.get("/api/proxies", (_req, res) => {
+    res.json({
+      proxies: rawProxyPool,
+      validated: validatedProxies,
+      fetchedAt: rawFetchedAt,
+      total: rawProxyPool.length,
+      validatedCount: validatedProxies.length,
+    });
   });
 
   app.post("/api/proxies/refresh", async (_req, res) => {
-    proxyPool = [];
-    proxyFetchedAt = 0;
-    await refreshProxyPool();
-    res.json({ proxies: proxyPool, fetchedAt: proxyFetchedAt, total: proxyPool.length });
+    rawProxyPool = [];
+    rawFetchedAt = 0;
+    validatedProxies = [];
+    await fetchRawProxies();
+    res.json({
+      proxies: rawProxyPool,
+      validated: validatedProxies,
+      fetchedAt: rawFetchedAt,
+      total: rawProxyPool.length,
+      validatedCount: validatedProxies.length,
+    });
   });
 
-  // ── YouTube: search ────────────────────────────────────────────────────────
+  // ── YouTube: search ───────────────────────────────────────────────────────
   app.get(api.yt.search.path, async (req, res) => {
     try {
       const query = req.query.q as string;
@@ -201,28 +325,28 @@ export async function registerRoutes(
       const results = await yt.search(query);
 
       const items = results.videos
-        .map((video: any) => ({
-          id: video.id,
-          title: video.title?.text || video.title || "",
-          thumbnail: video.thumbnails?.[0]?.url || "",
-          channelTitle: video.author?.name || "",
-          channelId: video.author?.id || "",
-          viewCount: video.view_count?.text || "",
-          publishedTime: video.published?.text || "",
-          lengthSeconds: String(video.duration?.seconds || 0),
-          isShort: !!video.is_short,
+        .map((v: any) => ({
+          id: v.id,
+          title: v.title?.text || v.title || "",
+          thumbnail: v.thumbnails?.[0]?.url || "",
+          channelTitle: v.author?.name || "",
+          channelId: v.author?.id || "",
+          viewCount: v.view_count?.text || "",
+          publishedTime: v.published?.text || "",
+          lengthSeconds: String(v.duration?.seconds || 0),
+          isShort: !!v.is_short,
         }))
-        .filter((item: any) => item.id && item.title);
+        .filter((i: any) => i.id && i.title);
 
       res.json(items);
-    } catch (error: any) {
-      console.error("Search error:", error.message);
-      youtube = null; // force session refresh on next request
+    } catch (err: any) {
+      console.error("Search error:", err.message);
+      invalidateSession(err.message);
       res.status(500).json({ message: "Search failed. Please try again." });
     }
   });
 
-  // ── YouTube: video info ────────────────────────────────────────────────────
+  // ── YouTube: video info ───────────────────────────────────────────────────
   app.get(api.yt.video.path, async (req, res) => {
     try {
       const { id } = req.params;
@@ -235,25 +359,19 @@ export async function registerRoutes(
         description: info.basic_info.short_description || "",
         thumbnail: info.basic_info.thumbnail?.[0]?.url || "",
         channelId: info.basic_info.channel_id || "",
-        channelTitle:
-          (info.basic_info as any).channel?.name ||
-          (info.basic_info as any).author || "",
-        viewCount: info.basic_info.view_count
-          ? `${Number(info.basic_info.view_count).toLocaleString()} views`
-          : "0 views",
-        likeCount: info.basic_info.like_count
-          ? String(info.basic_info.like_count)
-          : "0",
+        channelTitle: (info.basic_info as any).channel?.name || (info.basic_info as any).author || "",
+        viewCount: info.basic_info.view_count ? `${Number(info.basic_info.view_count).toLocaleString()} views` : "0 views",
+        likeCount: info.basic_info.like_count ? String(info.basic_info.like_count) : "0",
         publishedTime: "",
       });
-    } catch (error: any) {
-      console.error("Video info error:", error.message);
-      youtube = null;
+    } catch (err: any) {
+      console.error("Video info error:", err.message);
+      invalidateSession(err.message);
       res.status(404).json({ message: "Video not found or restricted" });
     }
   });
 
-  // ── YouTube: subtitles ─────────────────────────────────────────────────────
+  // ── YouTube: subtitles ────────────────────────────────────────────────────
   app.get(`${api.yt.video.path}/subtitles`, async (req, res) => {
     try {
       const { id } = req.params;
@@ -262,86 +380,77 @@ export async function registerRoutes(
       const captions = info.captions;
       if (!captions) return res.json([]);
 
-      const tracks = (captions as any).caption_tracks.map((track: any) => ({
-        label: track.name.text,
-        languageCode: track.language_code,
-        // Route subtitle URLs through /api/proxy (CORS fix)
-        url: `/api/proxy?url=${encodeURIComponent(track.base_url)}`,
-        kind: track.kind,
+      const tracks = (captions as any).caption_tracks.map((t: any) => ({
+        label: t.name.text,
+        languageCode: t.language_code,
+        url: `/api/proxy?url=${encodeURIComponent(t.base_url)}`,
+        kind: t.kind,
       }));
-
       res.json(tracks);
-    } catch (error: any) {
-      console.error("Subtitles error:", error.message);
+    } catch (err: any) {
+      console.error("Subtitles error:", err.message);
       res.json([]);
     }
   });
 
-  // ── YouTube: stream ────────────────────────────────────────────────────────
+  // ── YouTube: stream ───────────────────────────────────────────────────────
   app.get(api.yt.stream.path, async (req, res) => {
     try {
       const { id } = req.params;
-      const streamUrl = await getStreamUrl(id);
-      res.redirect(302, streamUrl);
-    } catch (error: any) {
-      console.error("Stream error:", error.message);
-      youtube = null;
-      if (!res.headersSent)
-        res.status(500).json({ message: "Could not get stream URL" });
+      const url = await getStreamUrl(id);
+      res.redirect(302, url);
+    } catch (err: any) {
+      console.error("Stream error:", err.message);
+      invalidateSession(err.message);
+      if (!res.headersSent) res.status(500).json({ message: "Could not get stream URL" });
     }
   });
 
-  // ── YouTube: comments ──────────────────────────────────────────────────────
+  // ── YouTube: comments ─────────────────────────────────────────────────────
   app.get(api.yt.comments.path, async (req, res) => {
     try {
       const { id } = req.params;
       const yt = await getYoutube();
       const comments = await yt.getComments(id);
 
-      const mapped = comments.contents
-        .map((c: any) => {
-          try {
-            return {
-              id: c.comment_id || c.commentId || String(Math.random()),
-              author: c.author?.name || "Unknown",
-              authorThumbnail: c.author?.thumbnails?.[0]?.url || "",
-              text: c.content?.text || "",
-              publishedTime: c.published?.text || "",
-              likeCount: c.vote_count?.text || c.voteCount?.text || "0",
-              replyCount: c.reply_count || c.replyCount || 0,
-            };
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
+      const mapped = comments.contents.map((c: any) => {
+        try {
+          return {
+            id: c.comment_id || c.commentId || String(Math.random()),
+            author: c.author?.name || "Unknown",
+            authorThumbnail: c.author?.thumbnails?.[0]?.url || "",
+            text: c.content?.text || "",
+            publishedTime: c.published?.text || "",
+            likeCount: c.vote_count?.text || "0",
+            replyCount: c.reply_count || 0,
+          };
+        } catch { return null; }
+      }).filter(Boolean);
 
       res.json(mapped);
-    } catch (error: any) {
-      console.error("Comments error:", error.message);
+    } catch (err: any) {
+      console.error("Comments error:", err.message);
       res.json([]);
     }
   });
 
-  // ── YouTube: channel ───────────────────────────────────────────────────────
+  // ── YouTube: channel ──────────────────────────────────────────────────────
   app.get(api.yt.channel.path, async (req, res) => {
     try {
       const { id } = req.params;
       const yt = await getYoutube();
-      const channel = await yt.getChannel(id);
+      const ch = await yt.getChannel(id);
 
       res.json({
-        id: (channel as any).metadata?.external_id || id,
-        title: (channel as any).metadata?.title || "",
-        description: (channel as any).metadata?.description || "",
-        thumbnail:
-          (channel as any).metadata?.avatar?.[0]?.url ||
-          (channel as any).metadata?.thumbnail?.[0]?.url || "",
-        banner: (channel as any).header?.banner?.[0]?.url || "",
-        subscriberCount: (channel as any).metadata?.subscribers?.text || "",
+        id: (ch as any).metadata?.external_id || id,
+        title: (ch as any).metadata?.title || "",
+        description: (ch as any).metadata?.description || "",
+        thumbnail: (ch as any).metadata?.avatar?.[0]?.url || (ch as any).metadata?.thumbnail?.[0]?.url || "",
+        banner: (ch as any).header?.banner?.[0]?.url || "",
+        subscriberCount: (ch as any).metadata?.subscribers?.text || "",
       });
-    } catch (error: any) {
-      console.error("Channel error:", error.message);
+    } catch (err: any) {
+      console.error("Channel error:", err.message);
       res.status(404).json({ message: "Channel not found" });
     }
   });
@@ -350,31 +459,28 @@ export async function registerRoutes(
     try {
       const { id } = req.params;
       const yt = await getYoutube();
-      const channel = await yt.getChannel(id);
-      const videos = await channel.getVideos();
+      const ch = await yt.getChannel(id);
+      const videos = await ch.getVideos();
 
-      const items = videos.videos.map((video: any) => ({
-        id: video.id,
-        title: video.title?.text || "",
-        thumbnail: video.thumbnails?.[0]?.url || "",
-        channelTitle: channel.metadata.title,
+      res.json(videos.videos.map((v: any) => ({
+        id: v.id,
+        title: v.title?.text || "",
+        thumbnail: v.thumbnails?.[0]?.url || "",
+        channelTitle: ch.metadata.title,
         channelId: id,
-        viewCount: video.view_count?.text || "",
-        publishedTime: video.published?.text || "",
-        lengthSeconds: String(video.duration?.seconds || 0),
-      }));
-
-      res.json(items);
-    } catch (error: any) {
-      console.error("Channel videos error:", error.message);
+        viewCount: v.view_count?.text || "",
+        publishedTime: v.published?.text || "",
+        lengthSeconds: String(v.duration?.seconds || 0),
+      })));
+    } catch (err: any) {
+      console.error("Channel videos error:", err.message);
       res.json([]);
     }
   });
 
-  // ── Favorites ──────────────────────────────────────────────────────────────
+  // ── Favorites ─────────────────────────────────────────────────────────────
   app.get(api.favorites.list.path, async (_req, res) => {
-    const favs = await storage.getFavorites(GUEST_USER_ID);
-    res.json(favs);
+    res.json(await storage.getFavorites(GUEST_USER_ID));
   });
 
   app.get(api.favorites.check.path, async (req, res) => {
