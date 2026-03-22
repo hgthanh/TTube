@@ -26,7 +26,7 @@ export default function VideoPage() {
   useEffect(() => { setLanUrl(window.location.href); }, [id]);
 
   const { data: video, isLoading: loadingVideo } = useVideo(id);
-  const streamUrl = useStreamUrl(id);
+  const { data: streamUrl, isLoading: loadingStream } = useStreamUrl(id);
   const { data: related } = useSearch(video?.title || "trending", "video");
 
   // Check favorite status
@@ -42,22 +42,29 @@ export default function VideoPage() {
     }
   }, [id, isAuthenticated]);
 
-  // Add to history
+  // Add to history — only when video is fully loaded with a valid id
   useEffect(() => {
-    if (!video) return;
+    if (!video?.id || !id) return;
+    const entry = {
+      videoId: video.id,
+      title: video.title || "Untitled",
+      thumbnailUrl: video.thumbnail || "",
+      channelName: video.channelTitle || "",
+    };
     if (isAuthenticated) {
       fetch("/api/history", {
-        method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({ videoId: video.id, title: video.title, thumbnailUrl: video.thumbnail, channelName: video.channelTitle }),
+        method: "POST",
+        headers: { ...authHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify(entry),
       }).catch(() => {});
     } else {
       const historyJson = localStorage.getItem("history");
       let history = historyJson ? JSON.parse(historyJson) : [];
       history = history.filter((h: any) => h.videoId !== id);
-      history.unshift({ videoId: video.id, title: video.title, thumbnailUrl: video.thumbnail, channelName: video.channelTitle, watchedAt: new Date().toISOString() });
+      history.unshift({ ...entry, watchedAt: new Date().toISOString() });
       localStorage.setItem("history", JSON.stringify(history.slice(0, 50)));
     }
-  }, [video, isAuthenticated]);
+  }, [video?.id, isAuthenticated]);
 
   const toggleFavorite = async () => {
     if (!video) return;
@@ -94,7 +101,7 @@ export default function VideoPage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div className="lg:col-span-2 space-y-6">
           <div className="space-y-4">
-            <VideoPlayer url={streamUrl||undefined} thumbnail={video?.thumbnail} isLoading={loadingVideo} audioOnly={audioOnly} videoId={id} />
+            <VideoPlayer url={streamUrl ?? undefined} thumbnail={video?.thumbnail} isLoading={loadingVideo || loadingStream} audioOnly={audioOnly} videoId={id} />
             <div className="flex items-center justify-between">
               <h1 className="text-xl md:text-2xl font-display font-bold line-clamp-2">
                 {loadingVideo ? <Skeleton className="h-8 w-3/4" /> : video?.title}

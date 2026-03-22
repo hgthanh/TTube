@@ -229,12 +229,53 @@ const streamCache = new Map<string, { url: string; expires: number }>();
 async function getStreamUrl(videoId: string): Promise<string> {
   const cached = streamCache.get(videoId);
   if (cached && cached.expires > Date.now()) return cached.url;
+
   const yt = await getYoutube();
   const info = await yt.getInfo(videoId);
-  const format = info.chooseFormat({ type: "video+audio", quality: "best" });
-  if (!format) throw new Error("No suitable format");
-  const raw = String(await format.decipher(yt.session.player));
-  const proxied = `/api/proxy?url=${encodeURIComponent(raw)}`;
+
+  // Gather all candidate formats (combined first, then adaptive)
+  const combined: any[] = info.streaming_data?.formats ?? [];
+  const adaptive: any[] = info.streaming_data?.adaptive_formats ?? [];
+  const allFormats: any[] = [...combined, ...adaptive];
+
+  // Prefer a video+audio combined format; fall back to any format
+  const preferred = info.chooseFormat({ type: "video+audio", quality: "best" });
+  const candidates = preferred
+    ? [preferred, ...allFormats.filter(f => f !== preferred)]
+    : allFormats;
+
+  let rawUrl: string | null = null;
+
+  for (const fmt of candidates) {
+    if (!fmt) continue;
+
+    // 1. Direct URL — no player JS needed (works even when decipher fails)
+    if (fmt.url) {
+      rawUrl = fmt.url;
+      console.log("[stream] direct URL found");
+      break;
+    }
+
+    // 2. Decipher URL — requires player JS
+    try {
+      const deciphered = await fmt.decipher(yt.session.player);
+      if (deciphered) {
+        rawUrl = String(deciphered);
+        console.log("[stream] deciphered URL");
+        break;
+      }
+    } catch {
+      // decipher failed for this format, try next
+    }
+  }
+
+  if (!rawUrl) {
+    // Don't invalidate the whole session — search/info still work fine.
+    // Only the player JS extraction failed. Let the client use the embed iframe.
+    throw new Error("NO_STREAM_URL");
+  }
+
+  const proxied = `/api/proxy?url=${encodeURIComponent(rawUrl)}`;
   streamCache.set(videoId, { url: proxied, expires: Date.now() + 30 * 60 * 1000 });
   if (streamCache.size > 50) { const k = streamCache.keys().next().value; if (k) streamCache.delete(k); }
   return proxied;
@@ -377,7 +418,11 @@ app.get("/api/yt/video/:id/subtitles", async (req, res) => {
 app.get("/api/yt/stream/:id", async (req, res) => {
   try {
     res.redirect(302, await getStreamUrl(req.params.id));
-  } catch (err:any) { invalidateSession(err.message); if (!res.headersSent) res.status(500).json({ message:"Stream failed" }); }
+  } catch (err: any) {
+    if (err.message === "NO_STREAM_URL") return res.status(204).end();
+    invalidateSession(err.message);
+    if (!res.headersSent) res.status(500).json({ message: "Stream failed" });
+  }
 });
 
 // ── YouTube: comments ─────────────────────────────────────────────────────────
@@ -422,7 +467,7 @@ app.get("/api/favorites/:videoId/check", authMiddleware, async (req, res) => {
 app.post("/api/favorites", authMiddleware, async (req, res) => {
   try {
     const {userId} = (req as any).user;
-    const { videoId, title, thumbnailUrl, channelName } = z.object({ videoId:z.string(), title:z.string(), thumbnailUrl:z.string().optional(), channelName:z.string().optional() }).parse(req.body);
+    const { videoId, title, thumbnailUrl, channelName } = z.object({ videoId:z.string().min(1), title:z.string().default(""), thumbnailUrl:z.string().nullable().optional(), channelName:z.string().nullable().optional() }).parse(req.body);
     const existing = await query<any>("SELECT id FROM favorites WHERE user_id=? AND video_id=?", [userId, videoId]);
     if (existing.length) return res.json(existing[0]);
     const [r]: any = await getPool().execute("INSERT INTO favorites (user_id,video_id,title,thumbnail_url,channel_name) VALUES (?,?,?,?,?)", [userId, videoId, title, thumbnailUrl||null, channelName||null]);
@@ -445,7 +490,7 @@ app.get("/api/history", authMiddleware, async (req, res) => {
 app.post("/api/history", authMiddleware, async (req, res) => {
   try {
     const {userId} = (req as any).user;
-    const { videoId, title, thumbnailUrl, channelName } = z.object({ videoId:z.string(), title:z.string(), thumbnailUrl:z.string().optional(), channelName:z.string().optional() }).parse(req.body);
+    const { videoId, title, thumbnailUrl, channelName } = z.object({ videoId:z.string().min(1), title:z.string().default(""), thumbnailUrl:z.string().nullable().optional(), channelName:z.string().nullable().optional() }).parse(req.body);
     await getPool().execute("INSERT INTO history (user_id,video_id,title,thumbnail_url,channel_name) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE title=VALUES(title),thumbnail_url=VALUES(thumbnail_url),channel_name=VALUES(channel_name),watched_at=NOW()", [userId, videoId, title, thumbnailUrl||null, channelName||null]);
     res.status(201).json({ ok: true });
   } catch (err) { if (err instanceof z.ZodError) return res.status(400).json(err.issues); res.status(500).json({ message:"Error" }); }
