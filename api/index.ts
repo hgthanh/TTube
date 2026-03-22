@@ -10,6 +10,20 @@ import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
+// ─── Suppress known harmless youtubei.js parser warnings ─────────────────────
+// YouTube adds new menu types (e.g. ListItemView/"Remove ads") that youtubei.js
+// has not registered yet. These warnings are cosmetic and do not affect function.
+const _origWarn = console.warn.bind(console);
+console.warn = (...args: any[]) => {
+  const first = String(args[0] ?? "");
+  if (first.includes("[YOUTUBEJS]") && (
+    first.includes("ParsingError") ||
+    first.includes("Failed to extract signature") ||
+    first.includes("Failed to extract n decipher")
+  )) return;
+  _origWarn(...args);
+};
+
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || "ttube-secret-change-in-prod";
 const DB_CONFIG = {
