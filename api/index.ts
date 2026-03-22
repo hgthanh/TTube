@@ -10,19 +10,24 @@ import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-// ─── Suppress known harmless youtubei.js parser warnings ─────────────────────
-// YouTube adds new menu types (e.g. ListItemView/"Remove ads") that youtubei.js
-// has not registered yet. These warnings are cosmetic and do not affect function.
+// ─── Suppress known harmless youtubei.js noise ───────────────────────────────
+// youtubei.js v16 logs parser warnings for new YouTube UI elements it hasn't
+// registered yet (e.g. ListItemView, VideoSummaryContentView) and player
+// decipher failures. These are cosmetic — they don't affect API functionality.
+// We patch both console.warn and console.error because youtubei uses both.
+const YTJS_NOISE = [
+  "ParsingError", "Failed to extract signature", "Failed to extract n decipher",
+  "Unable to find matching run", "VideoSummaryContentView", "ListItemView",
+];
+function isYtjsNoise(args: any[]): boolean {
+  const s = String(args[0] ?? "");
+  return s.includes("[YOUTUBEJS]") && YTJS_NOISE.some(p => s.includes(p));
+}
 const _origWarn = console.warn.bind(console);
-console.warn = (...args: any[]) => {
-  const first = String(args[0] ?? "");
-  if (first.includes("[YOUTUBEJS]") && (
-    first.includes("ParsingError") ||
-    first.includes("Failed to extract signature") ||
-    first.includes("Failed to extract n decipher")
-  )) return;
-  _origWarn(...args);
-};
+const _origError = console.error.bind(console);
+console.warn = (...args: any[]) => { if (!isYtjsNoise(args)) _origWarn(...args); };
+// youtubei also uses console.error for some parse failures
+console.error = (...args: any[]) => { if (!isYtjsNoise(args)) _origError(...args); };
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || "ttube-secret-change-in-prod";
@@ -244,48 +249,49 @@ async function getStreamUrl(videoId: string): Promise<string> {
   const cached = streamCache.get(videoId);
   if (cached && cached.expires > Date.now()) return cached.url;
 
-  const yt = await getYoutube();
-  const info = await yt.getInfo(videoId);
-
-  // Gather all candidate formats (combined first, then adaptive)
-  const combined: any[] = info.streaming_data?.formats ?? [];
-  const adaptive: any[] = info.streaming_data?.adaptive_formats ?? [];
-  const allFormats: any[] = [...combined, ...adaptive];
-
-  // Prefer a video+audio combined format; fall back to any format
-  const preferred = info.chooseFormat({ type: "video+audio", quality: "best" });
-  const candidates = preferred
-    ? [preferred, ...allFormats.filter(f => f !== preferred)]
-    : allFormats;
-
   let rawUrl: string | null = null;
 
-  for (const fmt of candidates) {
-    if (!fmt) continue;
+  try {
+    const yt = await getYoutube();
+    const info = await yt.getInfo(videoId);
 
-    // 1. Direct URL — no player JS needed (works even when decipher fails)
-    if (fmt.url) {
-      rawUrl = fmt.url;
-      console.log("[stream] direct URL found");
-      break;
-    }
+    // Build candidate list: combined (video+audio) formats first, then adaptive
+    const sdFormats: any[] = info.streaming_data?.formats ?? [];
+    const adFormats: any[] = info.streaming_data?.adaptive_formats ?? [];
+    let allFormats: any[] = [...sdFormats, ...adFormats];
 
-    // 2. Decipher URL — requires player JS
-    try {
-      const deciphered = await fmt.decipher(yt.session.player);
-      if (deciphered) {
-        rawUrl = String(deciphered);
-        console.log("[stream] deciphered URL");
+    // Prefer best combined format; fall back to any format
+    let preferred: any = null;
+    try { preferred = info.chooseFormat({ type: "video+audio", quality: "best" }); } catch {}
+    const candidates: any[] = preferred
+      ? [preferred, ...allFormats.filter(f => f !== preferred)]
+      : allFormats;
+
+    for (const fmt of candidates) {
+      if (!fmt) continue;
+      // 1. Direct URL — always works, no player JS required
+      if (fmt.url && typeof fmt.url === "string" && fmt.url.startsWith("http")) {
+        rawUrl = fmt.url;
+        console.log("[stream] direct URL");
         break;
       }
-    } catch {
-      // decipher failed for this format, try next
+      // 2. Decipher — needs player JS (may fail on Vercel if YT changed obfuscation)
+      if (yt.session.player) {
+        try {
+          const dec = await fmt.decipher(yt.session.player);
+          if (dec) { rawUrl = String(dec); console.log("[stream] deciphered"); break; }
+        } catch { /* format failed, try next */ }
+      }
     }
+  } catch (inner: any) {
+    // Any unexpected error (chooseFormat throws, getInfo fails, etc.)
+    // Don't invalidate session — video info/search still works fine.
+    console.log("[stream] error getting URL:", inner.message);
+    throw new Error("NO_STREAM_URL");
   }
 
   if (!rawUrl) {
-    // Don't invalidate the whole session — search/info still work fine.
-    // Only the player JS extraction failed. Let the client use the embed iframe.
+    console.log("[stream] no URL found — using embed fallback");
     throw new Error("NO_STREAM_URL");
   }
 

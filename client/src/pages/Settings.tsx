@@ -33,6 +33,8 @@ export default function Settings() {
   const { t, lang, setLang } = useLang();
   const { isAuthenticated, authHeaders, user } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Prevent saveSettings from firing during initial data load
+  const initialized = useRef(false);
 
   const [proxyEnabled, setProxyEnabled] = useState(true);
   const [customProxy, setCustomProxy] = useState("");
@@ -82,8 +84,9 @@ export default function Settings() {
           if (data.user_keywords) {
             try { setKeywords(typeof data.user_keywords === "string" ? JSON.parse(data.user_keywords) : data.user_keywords); } catch {}
           }
+          initialized.current = true;
         })
-        .catch(() => loadFromLocalStorage());
+        .catch(() => { loadFromLocalStorage(); initialized.current = true; });
     } else {
       loadFromLocalStorage();
     }
@@ -116,9 +119,12 @@ export default function Settings() {
     if (savedKeywords) { try { setKeywords(JSON.parse(savedKeywords)); } catch {} }
     const savedEnabled = localStorage.getItem("proxy_enabled");
     if (savedEnabled !== null) setProxyEnabled(savedEnabled === "true");
+    initialized.current = true;
   };
 
   const saveSettings = async (overrides?: Record<string, any>) => {
+    // Don't sync during initial data load to avoid spurious PUT requests
+    if (!initialized.current) return;
     const payload = {
       custom_proxy: customProxy,
       proxy_enabled: proxyEnabled,
@@ -127,7 +133,7 @@ export default function Settings() {
       ...overrides,
     };
     // Always save to localStorage as fallback
-    localStorage.setItem("custom_proxy", payload.custom_proxy);
+    localStorage.setItem("custom_proxy", payload.custom_proxy || "");
     localStorage.setItem("proxy_enabled", String(payload.proxy_enabled));
     localStorage.setItem("user_keywords", JSON.stringify(payload.user_keywords));
     // Sync to server if logged in
