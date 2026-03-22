@@ -1,6 +1,6 @@
 {
-  "name": "LibreTube",
-  "short_name": "LibreTube",
+  "name": "TTube",
+  "short_name": "TTube",
   "description": "Ad-free YouTube alternative frontend",
   "start_url": "/",
   "display": "standalone",
