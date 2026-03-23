@@ -13,9 +13,9 @@ export function Sidebar({ isOpen }: SidebarProps) {
   const { t } = useLang();
 
   const NAV_ITEMS = [
-    { icon: Home, label: t.home, href: "/" },
+    { icon: Home, label: t.home, href: "/home" },
     { icon: Zap, label: t.shorts, href: "/shorts" },
-    { icon: Flame, label: t.trending, href: "/search?q=trending" },
+    { icon: Flame, label: t.trending, href: "/trending" },
     { icon: Heart, label: t.favorites, href: "/favorites" },
     { icon: History, label: t.history, href: "/history" },
   ];

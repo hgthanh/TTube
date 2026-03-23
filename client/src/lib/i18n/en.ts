@@ -51,6 +51,13 @@ export const en = {
   subtitles: "Subtitles", off: "Off", playbackSpeed: "Playback Speed", normal: "Normal",
   pipMode: "Picture-in-Picture", backgroundPlay: "Background Play",
   // General
+  trendingPage: "Trending",
+  trendingNow: "Now",
+  playlist: "Playlist",
+  playAll: "Play all",
+  noContent: "No content available.",
+  homeFeed: "Home",
+  searchSuggestions: "Suggestions",
   views: "views", loadMore: "Load more", notFound: "Page not found",
   goHome: "Go Home", videosCount: "videos",
 };

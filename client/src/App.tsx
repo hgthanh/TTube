@@ -18,12 +18,17 @@ import LoginPage from "@/pages/Login";
 import RegisterPage from "@/pages/Register";
 import TermsPage from "@/pages/Terms";
 import PrivacyPage from "@/pages/Privacy";
+import TrendingPage from "@/pages/Trending";
+import PlaylistPage from "@/pages/Playlist";
 
 function Router() {
   return (
     <Switch>
       <Route path="/" component={Home} />
+      <Route path="/home" component={Home} />
       <Route path="/shorts" component={Shorts} />
+      <Route path="/trending" component={TrendingPage} />
+      <Route path="/playlist/:id" component={PlaylistPage} />
       <Route path="/search" component={Search} />
       <Route path="/watch/:id" component={VideoPage} />
       <Route path="/favorites" component={Favorites} />

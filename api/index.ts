@@ -4,30 +4,31 @@
  */
 import express, { type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { Innertube } from "youtubei.js";
+import { Innertube, Log, Platform, type Types } from "youtubei.js";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-// ─── Suppress known harmless youtubei.js noise ───────────────────────────────
-// youtubei.js v16 logs parser warnings for new YouTube UI elements it hasn't
-// registered yet (e.g. ListItemView, VideoSummaryContentView) and player
-// decipher failures. These are cosmetic — they don't affect API functionality.
-// We patch both console.warn and console.error because youtubei uses both.
-const YTJS_NOISE = [
-  "ParsingError", "Failed to extract signature", "Failed to extract n decipher",
-  "Unable to find matching run", "VideoSummaryContentView", "ListItemView",
-];
-function isYtjsNoise(args: any[]): boolean {
-  const s = String(args[0] ?? "");
-  return s.includes("[YOUTUBEJS]") && YTJS_NOISE.some(p => s.includes(p));
-}
-const _origWarn = console.warn.bind(console);
-const _origError = console.error.bind(console);
-console.warn = (...args: any[]) => { if (!isYtjsNoise(args)) _origWarn(...args); };
-// youtubei also uses console.error for some parse failures
-console.error = (...args: any[]) => { if (!isYtjsNoise(args)) _origError(...args); };
+
+// ─── Silence ALL youtubei.js logs ──────────────────────────────────────────────
+// Per docs: https://ytjs.dev/guide/troubleshooting.html
+Log.setLevel(Log.Level.NONE);
+
+// ─── Enable stream URL decipher in Node.js / Vercel serverless ─────────────────
+// youtubei.js needs a JS interpreter to decipher stream URLs.
+// Per docs: https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
+Platform.shim.eval = async (
+  data: Types.BuildScriptResult,
+  env: Record<string, Types.VMPrimative>
+) => {
+  const props: string[] = [];
+  if (env.n)   props.push(`n: exportedVars.nFunction("${env.n}")`);
+  if (env.sig) props.push(`sig: exportedVars.sigFunction("${env.sig}")`);
+  const code = `${data.output}\nreturn { ${props.join(", ")} }`;
+  // eslint-disable-next-line no-new-func
+  return new Function(code)();
+};
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || "ttube-secret-change-in-prod";
@@ -606,6 +607,106 @@ app.get("/api/yt/channel/:id/videos", async (req, res) => {
     const videos = await ch.getVideos();
     res.json(videos.videos.map((v:any)=>({ id:v.id, title:v.title?.text||"", thumbnail:v.thumbnails?.[0]?.url||"", channelTitle:ch.metadata.title, channelId:req.params.id, viewCount:v.view_count?.text||"", publishedTime:v.published?.text||"", lengthSeconds:String(v.duration?.seconds||0) })));
   } catch (err:any) { console.error("Channel videos:",err.message); res.json([]); }
+});
+
+
+// ── YouTube: home feed ────────────────────────────────────────────────────────
+app.get("/api/yt/home", async (_req, res) => {
+  try {
+    const yt = await getYoutube();
+    const feed = await yt.getHomeFeed();
+    const videos = (feed as any).videos ?? [];
+    res.json(videos.map((v: any) => ({
+      id: v.id,
+      title: v.title?.text || v.title || "",
+      thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || "",
+      channelTitle: v.author?.name || "",
+      channelId: v.author?.id || "",
+      viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
+      publishedTime: v.published?.text || "",
+      lengthSeconds: String(v.duration?.seconds || 0),
+      isShort: !!v.is_short,
+    })).filter((v: any) => v.id && v.title));
+  } catch (err: any) {
+    console.error("Home feed:", err.message);
+    res.status(500).json({ message: "Could not load home feed" });
+  }
+});
+
+// ── YouTube: trending ─────────────────────────────────────────────────────────
+app.get("/api/yt/trending", async (req, res) => {
+  try {
+    const yt = await getYoutube();
+    // category: "Now" | "Music" | "Gaming" | "Movies"
+    const category = (req.query.category as string) || "Now";
+    const trending = await yt.getTrending();
+    let videos: any[] = [];
+    try {
+      if (category === "Music") videos = (await trending.getMusic()).videos ?? [];
+      else if (category === "Gaming") videos = (await trending.getGaming()).videos ?? [];
+      else if (category === "Movies") videos = (await trending.getMovies()).videos ?? [];
+      else videos = (trending as any).videos ?? [];
+    } catch {
+      videos = (trending as any).videos ?? [];
+    }
+    res.json(videos.map((v: any) => ({
+      id: v.id,
+      title: v.title?.text || v.title || "",
+      thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || "",
+      channelTitle: v.author?.name || "",
+      channelId: v.author?.id || "",
+      viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
+      publishedTime: v.published?.text || "",
+      lengthSeconds: String(v.duration?.seconds || 0),
+      isShort: !!v.is_short,
+    })).filter((v: any) => v.id && v.title));
+  } catch (err: any) {
+    console.error("Trending:", err.message);
+    res.status(500).json({ message: "Could not load trending" });
+  }
+});
+
+// ── YouTube: search suggestions (autocomplete) ────────────────────────────────
+app.get("/api/yt/suggestions", async (req, res) => {
+  try {
+    const q = req.query.q as string;
+    if (!q) return res.json([]);
+    const yt = await getYoutube();
+    const suggestions = await yt.getSearchSuggestions(q);
+    res.json(suggestions);
+  } catch (err: any) {
+    console.error("Suggestions:", err.message);
+    res.json([]);
+  }
+});
+
+// ── YouTube: playlist ─────────────────────────────────────────────────────────
+app.get("/api/yt/playlist/:id", async (req, res) => {
+  try {
+    const yt = await getYoutube();
+    const playlist = await yt.getPlaylist(req.params.id);
+    const info = playlist as any;
+    const videos = info.videos ?? info.items ?? [];
+    res.json({
+      id: req.params.id,
+      title: info.info?.title || info.header?.title?.text || "",
+      description: info.info?.description || "",
+      videoCount: info.info?.total_items || videos.length,
+      thumbnail: info.info?.thumbnail?.[0]?.url || videos[0]?.thumbnails?.[0]?.url || "",
+      channelTitle: info.info?.author?.name || "",
+      videos: videos.map((v: any) => ({
+        id: v.id,
+        title: v.title?.text || v.title || "",
+        thumbnail: v.thumbnails?.[0]?.url || "",
+        channelTitle: v.author?.name || "",
+        channelId: v.author?.id || "",
+        lengthSeconds: String(v.duration?.seconds || 0),
+      })).filter((v: any) => v.id),
+    });
+  } catch (err: any) {
+    console.error("Playlist:", err.message);
+    res.status(404).json({ message: "Playlist not found" });
+  }
 });
 
 // ── Favorites (auth required) ─────────────────────────────────────────────────

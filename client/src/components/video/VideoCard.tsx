@@ -6,9 +6,10 @@ import { cn } from "@/lib/utils";
 interface VideoCardProps {
   video: YouTubeVideo;
   featured?: boolean;
+  compact?: boolean;
 }
 
-export function VideoCard({ video, featured = false }: VideoCardProps) {
+export function VideoCard({ video, featured = false, compact = false }: VideoCardProps) {
   return (
     <Link href={`/watch/${video.id}`} className="group block cursor-pointer">
       <div className={cn(

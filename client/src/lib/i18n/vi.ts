@@ -41,6 +41,13 @@ export const vi = {
   termsLink: "Điều khoản dịch vụ", privacyLink: "Chính sách bảo mật",
   subtitles: "Phụ đề", off: "Tắt", playbackSpeed: "Tốc độ phát", normal: "Bình thường",
   pipMode: "Hình trong hình (PiP)", backgroundPlay: "Phát trong nền",
+  trendingPage: "Thịnh hành",
+  trendingNow: "Xu hướng",
+  playlist: "Danh sách phát",
+  playAll: "Phát tất cả",
+  noContent: "Không có nội dung.",
+  homeFeed: "Trang chủ",
+  searchSuggestions: "Gợi ý tìm kiếm",
   views: "lượt xem", loadMore: "Tải thêm", notFound: "Không tìm thấy trang",
   goHome: "Về trang chủ", videosCount: "video",
 };
