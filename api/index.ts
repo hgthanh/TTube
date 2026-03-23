@@ -447,80 +447,68 @@ app.get("/api/yt/debug/:id", async (req, res) => {
 });
 
 // ── YouTube: video info ───────────────────────────────────────────────────────
+// Field paths verified from /api/yt/debug/:id output (youtubei.js v17):
+//   Channel name    → secondary_info.owner.author.name
+//   Channel ID      → secondary_info.owner.author.id
+//   Channel thumb   → secondary_info.owner.author.thumbnails[0].url
+//   Subscriber cnt  → secondary_info.owner.subscriber_count.text
+//   View count      → primary_info.view_count.view_count.text
+//   Title           → primary_info.title.text
+//   Published       → primary_info.published.text
+//   Description     → secondary_info.description.text
+//   Thumbnail       → basic_info.thumbnail[0].url
+//   Like count      → basic_info.like_count
 app.get("/api/yt/video/:id", async (req, res) => {
   try {
     const yt = await getYoutube();
     const info = await yt.getInfo(req.params.id);
-    const bi = info.basic_info as any;
-    const pi = (info as any).primary_info ?? {};
-    const si = (info as any).secondary_info ?? {};
+    const bi  = info.basic_info as any;
+    const pi  = (info as any).primary_info  ?? {};
+    const si  = (info as any).secondary_info ?? {};
 
-    // ── Channel name (try every known path across versions) ──
-    const channelTitle =
-      si.owner?.video_owner_renderer?.title?.runs?.[0]?.text ||  // v17 secondary_info
-      si.owner?.title?.runs?.[0]?.text ||
-      bi.channel?.name ||       // v16
-      bi.author ||              // v16 fallback
-      bi.channel_name ||
-      bi.owner?.channel_name ||
-      bi.owner?.name ||
-      "";
+    // ── Channel (from secondary_info.owner.author) ──────────────────────────
+    const author = si.owner?.author ?? {};
+    const channelTitle    = author.name || bi.channel?.name || bi.author || "";
+    const channelId       = author.id   || bi.channel_id   || bi.channel?.id || "";
+    // Use largest thumbnail available (first item = largest in v17)
+    const channelThumbnail = author.thumbnails?.[0]?.url || "";
 
-    // ── Channel ID ──
-    const channelId =
-      si.owner?.video_owner_renderer?.navigation_endpoint?.browse_endpoint?.browse_id ||
-      si.owner?.navigation_endpoint?.browse_endpoint?.browse_id ||
-      bi.channel_id ||
-      bi.channel?.id ||
-      bi.owner?.id ||
-      bi.owner?.external_channel_id ||
-      "";
+    // ── Subscriber count (secondary_info.owner.subscriber_count.text) ───────
+    const subscriberCount = si.owner?.subscriber_count?.text || "";
 
-    // ── Subscriber count (bonus: extract here so Video page shows it immediately) ──
-    const subscriberCount =
-      si.owner?.video_owner_renderer?.subscriber_count?.text ||
-      si.owner?.subscriber_count?.text ||
-      bi.subscriber_count?.text ||
-      "";
+    // ── Title (primary_info.title.text, fallback basic_info.title) ──────────
+    const title = pi.title?.text || bi.title || "";
 
-    // ── View count ──
-    let viewCount = "";
-    const rawViews =
-      pi.view_count?.video_view_count_renderer?.view_count?.text ||
-      pi.view_count?.text ||
-      bi.view_count;
-    if (rawViews != null) {
-      const n = Number(rawViews);
-      viewCount = isNaN(n) ? String(rawViews) : `${n.toLocaleString()} views`;
-    }
-    if (!viewCount) viewCount = bi.short_view_count_text?.text || "0 views";
+    // ── Description (secondary_info.description.text) ────────────────────────
+    const description = si.description?.text || bi.short_description || bi.description || "";
 
-    // ── Thumbnail ──
-    const thumbnail =
-      bi.thumbnail?.[0]?.url ||
-      bi.thumbnails?.[0]?.url ||
-      "";
+    // ── Thumbnail (basic_info.thumbnail) ─────────────────────────────────────
+    const thumbnail = bi.thumbnail?.[0]?.url || bi.thumbnails?.[0]?.url || "";
 
-    // ── Like count ──
-    const likeCount = bi.like_count != null ? String(bi.like_count) : "0";
+    // ── View count (primary_info.view_count.view_count.text) ─────────────────
+    const viewCount =
+      pi.view_count?.view_count?.text ||          // "13,630 views"
+      pi.view_count?.short_view_count?.text ||    // "13K views"
+      (() => {
+        const n = Number(bi.view_count);
+        return bi.view_count != null && !isNaN(n)
+          ? `${n.toLocaleString()} views`
+          : "";
+      })();
 
-    // ── Published date ──
+    // ── Published date (primary_info.published.text) ──────────────────────────
     const publishedTime =
-      pi.date_text?.text ||
-      bi.publish_date ||
-      bi.published_time_text?.text ||
-      "";
+      pi.published?.text ||        // "Mar 21, 2026"
+      pi.relative_date?.text ||    // "1 day ago"
+      bi.publish_date || "";
 
-    // ── Channel thumbnail (from secondary_info) ──
-    const channelThumbnail =
-      si.owner?.video_owner_renderer?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ||
-      si.owner?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ||
-      "";
+    // ── Like count (basic_info.like_count) ────────────────────────────────────
+    const likeCount = bi.like_count != null ? String(bi.like_count) : "0";
 
     res.json({
       id: bi.id || req.params.id,
-      title: bi.title || "",
-      description: bi.short_description || bi.description || "",
+      title,
+      description,
       thumbnail,
       channelId,
       channelTitle,
@@ -572,36 +560,42 @@ app.get("/api/yt/channel/:id", async (req, res) => {
   try {
     const yt = await getYoutube();
     const ch = await yt.getChannel(req.params.id);
-    const m = (ch as any).metadata ?? {};
-    const h = (ch as any).header ?? {};
+    const c = ch as any;
+    const m = c.metadata ?? {};
+    const h = c.header   ?? {};
+
+    // Thumbnail: try avatar (v17) → thumbnail (v16) → header
     const thumbnail =
       m.avatar?.[0]?.url ||
       m.thumbnail?.[0]?.url ||
-      h.avatar?.[0]?.url ||
-      (ch as any).thumbnail?.[0]?.url ||
-      "";
+      h.avatar?.thumbnails?.[0]?.url ||
+      h.thumbnail?.thumbnails?.[0]?.url ||
+      c.thumbnail?.[0]?.url || "";
+
+    // Banner
     const banner =
+      h.banner?.thumbnails?.slice(-1)?.[0]?.url ||
       h.banner?.[0]?.url ||
-      m.banner?.[0]?.url ||
-      (ch as any).header_links?.[0]?.thumbnail?.[0]?.url ||
-      "";
+      m.banner?.[0]?.url || "";
+
+    // Subscriber count: metadata.subscribers.text (v16) or header variations
     const subscriberCount =
       m.subscribers?.text ||
-      m.subscriber_count_text ||
+      h.subscribers_count_text?.text ||
       h.subscriber_count_text?.text ||
-      (ch as any).subscriber_count?.text ||
-      "";
+      c.subscriber_count?.text || "";
+
     res.json({
-      id: m.external_id || m.channel_id || req.params.id,
-      title: m.title || m.display_name || "",
+      id: m.external_id || m.channel_id || c.id || req.params.id,
+      title: m.title || m.display_name || c.title || "",
       description: m.description || "",
       thumbnail,
       banner,
       subscriberCount,
     });
-  } catch (err:any) {
-    console.error("Channel:",err.message);
-    res.status(404).json({ message:"Channel not found" });
+  } catch (err: any) {
+    console.error("Channel:", err.message);
+    res.status(404).json({ message: "Channel not found" });
   }
 });
 
