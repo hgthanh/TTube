@@ -637,29 +637,36 @@ app.get("/api/yt/home", async (_req, res) => {
 app.get("/api/yt/trending", async (req, res) => {
   try {
     const yt = await getYoutube();
-    // category: "Now" | "Music" | "Gaming" | "Movies"
     const category = (req.query.category as string) || "Now";
     const trending = await yt.getTrending();
-    let videos: any[] = [];
+
+    let raw: any[] = [];
     try {
-      if (category === "Music") videos = (await trending.getMusic()).videos ?? [];
-      else if (category === "Gaming") videos = (await trending.getGaming()).videos ?? [];
-      else if (category === "Movies") videos = (await trending.getMovies()).videos ?? [];
-      else videos = (trending as any).videos ?? [];
+      switch (category) {
+        case "Music":  raw = (await trending.getMusic()).videos  ?? []; break;
+        case "Gaming": raw = (await trending.getGaming()).videos ?? []; break;
+        case "Movies": raw = (await trending.getMovies()).videos ?? []; break;
+        default:       raw = (trending as any).videos            ?? [];
+      }
     } catch {
-      videos = (trending as any).videos ?? [];
+      // Category tab may not exist in this region — fall back to general trending
+      raw = (trending as any).videos ?? [];
     }
-    res.json(videos.map((v: any) => ({
+
+    const mapVideo = (v: any, rank: number) => ({
       id: v.id,
-      title: v.title?.text || v.title || "",
-      thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || "",
-      channelTitle: v.author?.name || "",
+      rank,
+      title: v.title?.text || v.title?.content || v.title || "",
+      thumbnail: v.best_thumbnail?.url || v.thumbnails?.slice(-1)?.[0]?.url || v.thumbnails?.[0]?.url || "",
+      channelTitle: v.author?.name || v.short_byline_text?.runs?.[0]?.text || "",
       channelId: v.author?.id || "",
       viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
-      publishedTime: v.published?.text || "",
+      publishedTime: v.published?.text || v.publish_date_text?.text || "",
       lengthSeconds: String(v.duration?.seconds || 0),
       isShort: !!v.is_short,
-    })).filter((v: any) => v.id && v.title));
+    });
+
+    res.json(raw.map(mapVideo).filter((v: any) => v.id && v.title));
   } catch (err: any) {
     console.error("Trending:", err.message);
     res.status(500).json({ message: "Could not load trending" });
@@ -707,6 +714,62 @@ app.get("/api/yt/playlist/:id", async (req, res) => {
     console.error("Playlist:", err.message);
     res.status(404).json({ message: "Playlist not found" });
   }
+});
+
+
+// ── LAN device registry ────────────────────────────────────────────────────────
+// Devices register themselves every 30s. We return the list so clients can
+// pick a target and "push" a video URL to it via server-sent events.
+const lanDevices = new Map<string, {
+  name: string; ip: string; ua: string; url: string; ts: number;
+}>();
+const lanPending = new Map<string, { videoUrl: string; from: string }>();
+
+app.post("/api/lan/register", (req, res) => {
+  const ip = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+  const { name } = req.body;
+  const deviceName = name || `Device (${ip.slice(-5)})`;
+  const id = `${ip}_${Buffer.from(deviceName).toString("base64").slice(0, 8)}`;
+  lanDevices.set(id, { name: deviceName, ip, ua: req.headers["user-agent"] || "", url: "", ts: Date.now() });
+  // Prune stale (> 90s)
+  for (const [k, v] of lanDevices) { if (Date.now() - v.ts > 90000) lanDevices.delete(k); }
+  res.json({ id, name: deviceName });
+});
+
+app.get("/api/lan/devices", (req, res) => {
+  const myIp = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "").split(",")[0].trim();
+  // Return only devices on the same /24 subnet
+  const mySubnet = myIp.split(".").slice(0, 3).join(".");
+  const now = Date.now();
+  const list = [...lanDevices.entries()]
+    .filter(([, v]) => v.ts > now - 90000 && (v.ip.startsWith(mySubnet) || mySubnet === ""))
+    .map(([id, v]) => ({ id, name: v.name, ip: v.ip }));
+  res.json(list);
+});
+
+app.post("/api/lan/push", (req, res) => {
+  const { targetId, videoUrl, fromName } = req.body;
+  if (!targetId || !videoUrl) return res.status(400).json({ message: "Missing targetId or videoUrl" });
+  lanPending.set(targetId, { videoUrl, from: fromName || "Someone" });
+  // Auto-clear after 60s
+  setTimeout(() => lanPending.delete(targetId), 60000);
+  res.json({ ok: true });
+});
+
+// Long-poll endpoint: target device polls here to receive pushed URLs
+app.get("/api/lan/poll/:deviceId", (req, res) => {
+  const { deviceId } = req.params;
+  // Update heartbeat
+  const dev = lanDevices.get(deviceId);
+  if (dev) { dev.ts = Date.now(); lanDevices.set(deviceId, dev); }
+
+  const pending = lanPending.get(deviceId);
+  if (pending) {
+    lanPending.delete(deviceId);
+    return res.json({ videoUrl: pending.videoUrl, from: pending.from });
+  }
+  // No pending — return empty (client will poll again after delay)
+  res.json({ videoUrl: null });
 });
 
 // ── Favorites (auth required) ─────────────────────────────────────────────────

@@ -20,6 +20,7 @@ import TermsPage from "@/pages/Terms";
 import PrivacyPage from "@/pages/Privacy";
 import TrendingPage from "@/pages/Trending";
 import PlaylistPage from "@/pages/Playlist";
+import { LANNotification } from "@/components/video/LANShare";
 
 function Router() {
   return (
