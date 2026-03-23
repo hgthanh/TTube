@@ -610,23 +610,95 @@ app.get("/api/yt/channel/:id/videos", async (req, res) => {
 });
 
 
+// ── Helper: map raw InnerTube video node → API response ──────────────────────
+function mapVideoNode(v: any, rank = 0): Record<string, any> {
+  return {
+    id: v.id || v.video_id,
+    rank,
+    title: v.title?.text || v.title?.content || v.title?.simpleText || v.title || "",
+    thumbnail:
+      v.best_thumbnail?.url ||
+      v.thumbnails?.slice(-1)?.[0]?.url ||
+      v.thumbnails?.[0]?.url || "",
+    channelTitle:
+      v.author?.name ||
+      v.short_byline_text?.runs?.[0]?.text ||
+      v.owner_text?.runs?.[0]?.text || "",
+    channelId: v.author?.id || v.channel_id || "",
+    viewCount:
+      v.view_count?.text ||
+      v.short_view_count_text?.text ||
+      v.short_view_count?.text || "",
+    publishedTime:
+      v.published?.text ||
+      v.publish_date_text?.text ||
+      v.published_time_text?.text || "",
+    lengthSeconds: String(v.duration?.seconds || 0),
+    isShort: !!v.is_short,
+  };
+}
+
+// ── Helper: extract video items from any InnerTube browse response ────────────
+function extractVideosFromPage(page: any): any[] {
+  const items: any[] = [];
+  // Walk through all possible containers
+  const tryPaths = [
+    page?.contents?.two_column_browse_results_renderer?.tabs,
+    page?.contents,
+    page?.on_response_received_actions,
+    page?.on_response_received_endpoints,
+  ];
+  // Recursive extractor
+  const walk = (node: any, depth = 0): void => {
+    if (!node || depth > 10) return;
+    if (Array.isArray(node)) { node.forEach(n => walk(n, depth + 1)); return; }
+    if (typeof node !== "object") return;
+    // Is this a video item?
+    const type = node.type || node.richItemRenderer?.content?.videoRenderer && "Video";
+    if (node.id && (node.title || node.video_id)) {
+      items.push(node); return;
+    }
+    // Drill into richItemRenderer / videoRenderer etc.
+    if (node.richItemRenderer?.content?.videoRenderer) {
+      items.push({ ...node.richItemRenderer.content.videoRenderer }); return;
+    }
+    if (node.videoRenderer) { items.push(node.videoRenderer); return; }
+    // Recurse into children
+    for (const key of ["content","contents","items","videos","tab_renderer","tabs","sections","shelf_renderer"]) {
+      if (node[key]) walk(node[key], depth + 1);
+    }
+  };
+  walk(page);
+  return items.filter(v => v.id || v.video_id);
+}
+
 // ── YouTube: home feed ────────────────────────────────────────────────────────
 app.get("/api/yt/home", async (_req, res) => {
   try {
     const yt = await getYoutube();
-    const feed = await yt.getHomeFeed();
-    const videos = (feed as any).videos ?? [];
-    res.json(videos.map((v: any) => ({
-      id: v.id,
-      title: v.title?.text || v.title || "",
-      thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || "",
-      channelTitle: v.author?.name || "",
-      channelId: v.author?.id || "",
-      viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
-      publishedTime: v.published?.text || "",
-      lengthSeconds: String(v.duration?.seconds || 0),
-      isShort: !!v.is_short,
-    })).filter((v: any) => v.id && v.title));
+    let videos: any[] = [];
+
+    // Try getHomeFeed() first (v16 API)
+    try {
+      const feed = await (yt as any).getHomeFeed();
+      videos = (feed as any).videos ?? [];
+    } catch {
+      // v17 fallback: browse FE home
+      try {
+        const page = await (yt as any).actions.execute("/browse", {
+          browseId: "FEwhat_to_watch",
+          parse: true,
+        });
+        videos = extractVideosFromPage(page);
+      } catch {}
+    }
+
+    res.json(
+      videos
+        .map((v: any) => mapVideoNode(v))
+        .filter((v: any) => v.id && v.title)
+        .slice(0, 40)
+    );
   } catch (err: any) {
     console.error("Home feed:", err.message);
     res.status(500).json({ message: "Could not load home feed" });
@@ -634,39 +706,58 @@ app.get("/api/yt/home", async (_req, res) => {
 });
 
 // ── YouTube: trending ─────────────────────────────────────────────────────────
+// getTrending() was removed in youtubei.js v17.
+// We use actions.execute('/browse') with InnerTube browseIds directly.
+// browseIds: FEtrending (Now), FEtrending_music, FEtrending_gaming, FEtrending_film
 app.get("/api/yt/trending", async (req, res) => {
   try {
     const yt = await getYoutube();
     const category = (req.query.category as string) || "Now";
-    const trending = await yt.getTrending();
+
+    const browseIdMap: Record<string, string> = {
+      Now:    "FEtrending",
+      Music:  "FEtrending_music",
+      Gaming: "FEtrending_gaming",
+      Movies: "FEtrending_film",
+    };
+    const browseId = browseIdMap[category] || "FEtrending";
 
     let raw: any[] = [];
+
+    // Method 1: actions.execute (v17 recommended)
     try {
-      switch (category) {
-        case "Music":  raw = (await trending.getMusic()).videos  ?? []; break;
-        case "Gaming": raw = (await trending.getGaming()).videos ?? []; break;
-        case "Movies": raw = (await trending.getMovies()).videos ?? []; break;
-        default:       raw = (trending as any).videos            ?? [];
-      }
-    } catch {
-      // Category tab may not exist in this region — fall back to general trending
-      raw = (trending as any).videos ?? [];
+      const page = await (yt as any).actions.execute("/browse", {
+        browseId,
+        parse: true,
+      });
+      raw = extractVideosFromPage(page);
+    } catch (e1: any) {
+      console.log("[trending] actions.execute failed:", e1.message, "— trying search fallback");
     }
 
-    const mapVideo = (v: any, rank: number) => ({
-      id: v.id,
-      rank,
-      title: v.title?.text || v.title?.content || v.title || "",
-      thumbnail: v.best_thumbnail?.url || v.thumbnails?.slice(-1)?.[0]?.url || v.thumbnails?.[0]?.url || "",
-      channelTitle: v.author?.name || v.short_byline_text?.runs?.[0]?.text || "",
-      channelId: v.author?.id || "",
-      viewCount: v.view_count?.text || v.short_view_count_text?.text || "",
-      publishedTime: v.published?.text || v.publish_date_text?.text || "",
-      lengthSeconds: String(v.duration?.seconds || 0),
-      isShort: !!v.is_short,
-    });
+    // Method 2: Search fallback (always works)
+    if (raw.length === 0) {
+      const searchMap: Record<string, string> = {
+        Now:    "trending viral today",
+        Music:  "music trending 2025",
+        Gaming: "gaming trending 2025",
+        Movies: "movies new releases 2025",
+      };
+      const searchQuery = searchMap[category] || "trending viral today";
+      try {
+        const results = await yt.search(searchQuery);
+        raw = results.videos ?? [];
+      } catch (e2: any) {
+        console.log("[trending] search fallback failed:", e2.message);
+      }
+    }
 
-    res.json(raw.map(mapVideo).filter((v: any) => v.id && v.title));
+    res.json(
+      raw
+        .map((v: any, i: number) => mapVideoNode(v, i + 1))
+        .filter((v: any) => v.id && v.title)
+        .slice(0, 50)
+    );
   } catch (err: any) {
     console.error("Trending:", err.message);
     res.status(500).json({ message: "Could not load trending" });
