@@ -115,24 +115,26 @@ export default function VideoPage() {
               {loadingVideo ? <Skeleton className="h-10 w-40" /> : (
                 <div className="flex items-center gap-3">
                   <Link href={`/channel/${video?.channelId}`}>
-                    {channel?.thumbnail ? (
+                    {(video?.channelThumbnail || channel?.thumbnail) ? (
                       <img
-                        src={channel.thumbnail}
+                        src={video?.channelThumbnail || channel?.thumbnail}
                         alt={video?.channelTitle}
                         className="w-10 h-10 rounded-full object-cover ring-2 ring-primary/20"
                       />
                     ) : (
                       <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-sm">
-                        {video?.channelTitle?.[0]}
+                        {video?.channelTitle?.[0] || "?"}
                       </div>
                     )}
                   </Link>
                   <div>
                     <Link href={`/channel/${video?.channelId}`}>
-                      <h3 className="font-semibold hover:text-primary transition-colors cursor-pointer">{video?.channelTitle}</h3>
+                      <h3 className="font-semibold hover:text-primary transition-colors cursor-pointer">
+                        {video?.channelTitle || channel?.title || <Skeleton className="h-4 w-32" />}
+                      </h3>
                     </Link>
                     <p className="text-xs text-muted-foreground">
-                      {channel?.subscriberCount || t.viewsHidden}
+                      {video?.subscriberCount || channel?.subscriberCount || ""}
                     </p>
                   </div>
                   <Button variant="secondary" size="sm" className="ml-4 rounded-full font-semibold">{t.subscribe}</Button>
@@ -166,8 +168,9 @@ export default function VideoPage() {
           </div>
 
           <div className="bg-secondary/30 rounded-xl p-4 text-sm whitespace-pre-wrap">
-            <div className="flex gap-4 font-bold mb-2">
-              <span>{video?.viewCount||"0 views"}</span><span>{video?.publishedTime||""}</span>
+            <div className="flex gap-4 font-bold mb-2 text-foreground">
+              <span>{video?.viewCount || ""}</span>
+              {video?.publishedTime && <span>{video.publishedTime}</span>}
             </div>
             <p className="text-muted-foreground leading-relaxed">{video?.description||t.noDescription}</p>
           </div>

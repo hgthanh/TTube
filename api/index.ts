@@ -425,47 +425,97 @@ app.get("/api/yt/search", async (req, res) => {
   } catch (err:any) { console.error("Search:",err.message); invalidateSession(err.message); res.status(500).json({ message:"Search failed" }); }
 });
 
+
+// ── DEBUG: inspect raw youtubei.js data (remove in production) ───────────────
+app.get("/api/yt/debug/:id", async (req, res) => {
+  try {
+    const yt = await getYoutube();
+    const info = await yt.getInfo(req.params.id);
+    const safe = (obj: any) => {
+      try { return JSON.parse(JSON.stringify(obj)); } catch { return String(obj); }
+    };
+    res.json({
+      basic_info: safe(info.basic_info),
+      primary_info: safe((info as any).primary_info),
+      secondary_info: safe((info as any).secondary_info),
+      streaming_data_keys: Object.keys((info as any).streaming_data ?? {}),
+      formats_count: (info.streaming_data?.formats?.length ?? 0) + (info.streaming_data?.adaptive_formats?.length ?? 0),
+    });
+  } catch (err: any) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── YouTube: video info ───────────────────────────────────────────────────────
 app.get("/api/yt/video/:id", async (req, res) => {
   try {
     const yt = await getYoutube();
     const info = await yt.getInfo(req.params.id);
     const bi = info.basic_info as any;
+    const pi = (info as any).primary_info ?? {};
+    const si = (info as any).secondary_info ?? {};
 
-    // Channel name: try multiple paths used across youtubei.js versions
+    // ── Channel name (try every known path across versions) ──
     const channelTitle =
-      bi.channel?.name ||      // v16 path
+      si.owner?.video_owner_renderer?.title?.runs?.[0]?.text ||  // v17 secondary_info
+      si.owner?.title?.runs?.[0]?.text ||
+      bi.channel?.name ||       // v16
       bi.author ||              // v16 fallback
-      bi.channel_name ||        // some v17 builds
-      bi.owner?.channel_name || // v17 path
-      bi.owner?.name ||         // v17 alt
+      bi.channel_name ||
+      bi.owner?.channel_name ||
+      bi.owner?.name ||
       "";
 
-    // Channel ID: multiple fallback paths
+    // ── Channel ID ──
     const channelId =
+      si.owner?.video_owner_renderer?.navigation_endpoint?.browse_endpoint?.browse_id ||
+      si.owner?.navigation_endpoint?.browse_endpoint?.browse_id ||
       bi.channel_id ||
       bi.channel?.id ||
       bi.owner?.id ||
       bi.owner?.external_channel_id ||
       "";
 
-    // Views: handle both number and pre-formatted string
-    let viewCount = "0 views";
-    if (bi.view_count != null) {
-      const n = Number(bi.view_count);
-      viewCount = isNaN(n) ? String(bi.view_count) : `${n.toLocaleString()} views`;
-    } else if (bi.short_view_count_text?.text) {
-      viewCount = bi.short_view_count_text.text;
-    }
+    // ── Subscriber count (bonus: extract here so Video page shows it immediately) ──
+    const subscriberCount =
+      si.owner?.video_owner_renderer?.subscriber_count?.text ||
+      si.owner?.subscriber_count?.text ||
+      bi.subscriber_count?.text ||
+      "";
 
-    // Thumbnail: try multiple paths
+    // ── View count ──
+    let viewCount = "";
+    const rawViews =
+      pi.view_count?.video_view_count_renderer?.view_count?.text ||
+      pi.view_count?.text ||
+      bi.view_count;
+    if (rawViews != null) {
+      const n = Number(rawViews);
+      viewCount = isNaN(n) ? String(rawViews) : `${n.toLocaleString()} views`;
+    }
+    if (!viewCount) viewCount = bi.short_view_count_text?.text || "0 views";
+
+    // ── Thumbnail ──
     const thumbnail =
       bi.thumbnail?.[0]?.url ||
       bi.thumbnails?.[0]?.url ||
       "";
 
-    // Like count
+    // ── Like count ──
     const likeCount = bi.like_count != null ? String(bi.like_count) : "0";
+
+    // ── Published date ──
+    const publishedTime =
+      pi.date_text?.text ||
+      bi.publish_date ||
+      bi.published_time_text?.text ||
+      "";
+
+    // ── Channel thumbnail (from secondary_info) ──
+    const channelThumbnail =
+      si.owner?.video_owner_renderer?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ||
+      si.owner?.thumbnail?.thumbnails?.slice(-1)?.[0]?.url ||
+      "";
 
     res.json({
       id: bi.id || req.params.id,
@@ -474,14 +524,16 @@ app.get("/api/yt/video/:id", async (req, res) => {
       thumbnail,
       channelId,
       channelTitle,
+      channelThumbnail,
+      subscriberCount,
       viewCount,
       likeCount,
-      publishedTime: bi.publish_date || bi.published_time_text?.text || "",
+      publishedTime,
     });
-  } catch (err:any) {
-    console.error("Video:",err.message);
+  } catch (err: any) {
+    console.error("Video:", err.message);
     invalidateSession(err.message);
-    res.status(404).json({ message:"Video not found" });
+    res.status(404).json({ message: "Video not found" });
   }
 });
 

@@ -9,10 +9,14 @@ interface VideoDetails {
   thumbnail: string;
   channelId: string;
   channelTitle: string;
+  channelThumbnail?: string;   // avatar URL from secondary_info
+  subscriberCount?: string;    // subscriber count from secondary_info
   viewCount: string;
   likeCount: string;
   publishedTime: string;
 }
+
+export type { VideoDetails };
 
 export function useSearch(query: string, type: 'video' | 'channel' | 'playlist' = 'video') {
   return useQuery<YouTubeVideo[]>({
