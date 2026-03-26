@@ -808,58 +808,99 @@ app.get("/api/yt/playlist/:id", async (req, res) => {
 });
 
 
-// ── LAN device registry ────────────────────────────────────────────────────────
-// Devices register themselves every 30s. We return the list so clients can
-// pick a target and "push" a video URL to it via server-sent events.
-const lanDevices = new Map<string, {
-  name: string; ip: string; ua: string; url: string; ts: number;
-}>();
-const lanPending = new Map<string, { videoUrl: string; from: string }>();
+// ── LAN device registry + WebRTC signaling ────────────────────────────────────
+// Devices are grouped by their PUBLIC IP (all devices on same LAN share it).
+// WebRTC offers/answers/candidates are stored here for P2P signaling.
+// Server-relay push is the fallback.
+
+interface LanDevice { name: string; publicIp: string; ts: number; }
+interface LanSignal { payload: any; from: string; ts: number; }
+interface LanPush   { videoUrl: string; from: string; }
+
+const lanDevices  = new Map<string, LanDevice>();
+const lanSignals  = new Map<string, LanSignal>();   // key: `${toId}:${type}`
+const lanPending  = new Map<string, LanPush>();
+
+function getPublicIp(req: any): string {
+  // x-forwarded-for on Vercel gives real client IP
+  const xff = req.headers["x-forwarded-for"] as string || "";
+  return (xff.split(",")[0] || req.socket?.remoteAddress || "unknown").trim();
+}
+
+function pruneLan() {
+  const cutoff = Date.now() - 90_000;
+  for (const [k, v] of lanDevices)  { if (v.ts < cutoff) lanDevices.delete(k); }
+  for (const [k, v] of lanSignals)  { if (v.ts < cutoff - 30_000) lanSignals.delete(k); }
+  for (const [k] of lanPending)     { /* pushed urls self-clear */ }
+}
+setInterval(pruneLan, 30_000);
 
 app.post("/api/lan/register", (req, res) => {
-  const ip = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "unknown").split(",")[0].trim();
-  const { name } = req.body;
-  const deviceName = name || `Device (${ip.slice(-5)})`;
-  const id = `${ip}_${Buffer.from(deviceName).toString("base64").slice(0, 8)}`;
-  lanDevices.set(id, { name: deviceName, ip, ua: req.headers["user-agent"] || "", url: "", ts: Date.now() });
-  // Prune stale (> 90s)
-  for (const [k, v] of lanDevices) { if (Date.now() - v.ts > 90000) lanDevices.delete(k); }
+  const publicIp  = getPublicIp(req);
+  const { name, id: existingId } = req.body;
+  const deviceName = name || `Device`;
+
+  // Reuse existing ID if provided and still valid
+  let id = existingId && lanDevices.has(existingId) ? existingId
+    : `${publicIp}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
+
+  lanDevices.set(id, { name: deviceName, publicIp, ts: Date.now() });
   res.json({ id, name: deviceName });
 });
 
 app.get("/api/lan/devices", (req, res) => {
-  const myIp = (req.headers["x-forwarded-for"] as string || req.socket.remoteAddress || "").split(",")[0].trim();
-  // Return only devices on the same /24 subnet
-  const mySubnet = myIp.split(".").slice(0, 3).join(".");
+  const publicIp = getPublicIp(req);
   const now = Date.now();
+  pruneLan();
+
+  // Only return devices sharing the SAME public IP (same network/NAT)
   const list = [...lanDevices.entries()]
-    .filter(([, v]) => v.ts > now - 90000 && (v.ip.startsWith(mySubnet) || mySubnet === ""))
-    .map(([id, v]) => ({ id, name: v.name, ip: v.ip }));
+    .filter(([, v]) => v.ts > now - 90_000 && v.publicIp === publicIp)
+    .map(([id, v]) => ({ id, name: v.name }));
+
   res.json(list);
 });
 
+// ── WebRTC signaling: store offer/answer/candidate ────────────────────────────
+app.post("/api/lan/signal", (req, res) => {
+  const { from, to, type, payload } = req.body;
+  if (!to || !type) return res.status(400).json({ message: "Missing to/type" });
+  const key = `${to}:${type}`;
+  lanSignals.set(key, { payload: { ...payload, fromId: from }, from: from || "", ts: Date.now() });
+  setTimeout(() => lanSignals.delete(key), 60_000);
+  res.json({ ok: true });
+});
+
+app.get("/api/lan/signal", (req, res) => {
+  const { id, type } = req.query as { id: string; type: string };
+  if (!id || !type) return res.status(400).json({ message: "Missing id/type" });
+  const key = `${id}:${type}`;
+  const signal = lanSignals.get(key);
+  if (signal) {
+    lanSignals.delete(key);          // consume once
+    // Update heartbeat for device
+    const dev = lanDevices.get(id);
+    if (dev) { dev.ts = Date.now(); lanDevices.set(id, dev); }
+    return res.json({ payload: signal.payload });
+  }
+  res.json({ payload: null });
+});
+
+// ── Server-relay push (fallback when WebRTC P2P fails) ───────────────────────
 app.post("/api/lan/push", (req, res) => {
   const { targetId, videoUrl, fromName } = req.body;
   if (!targetId || !videoUrl) return res.status(400).json({ message: "Missing targetId or videoUrl" });
   lanPending.set(targetId, { videoUrl, from: fromName || "Someone" });
-  // Auto-clear after 60s
-  setTimeout(() => lanPending.delete(targetId), 60000);
+  setTimeout(() => lanPending.delete(targetId), 60_000);
   res.json({ ok: true });
 });
 
-// Long-poll endpoint: target device polls here to receive pushed URLs
 app.get("/api/lan/poll/:deviceId", (req, res) => {
   const { deviceId } = req.params;
-  // Update heartbeat
   const dev = lanDevices.get(deviceId);
   if (dev) { dev.ts = Date.now(); lanDevices.set(deviceId, dev); }
-
   const pending = lanPending.get(deviceId);
-  if (pending) {
-    lanPending.delete(deviceId);
-    return res.json({ videoUrl: pending.videoUrl, from: pending.from });
-  }
-  // No pending — return empty (client will poll again after delay)
+  if (pending) { lanPending.delete(deviceId); return res.json(pending); }
   res.json({ videoUrl: null });
 });
 
