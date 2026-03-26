@@ -8,10 +8,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useVideo, useStreamUrl, useSearch, useChannel } from "@/hooks/use-yt";
 import { useAuth } from "@/contexts/AuthContext";
 import { useLang } from "@/contexts/LangContext";
-import { Share2, Heart, Headphones, QrCode } from "lucide-react";
+import { Share2, Heart, Headphones, Wifi } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { QRCodeSVG } from "qrcode.react";
+import { LANShareDialog } from "@/components/video/LANShare";
 
 export default function VideoPage() {
   const [match, params] = useRoute("/watch/:id");
@@ -19,11 +18,10 @@ export default function VideoPage() {
   const [audioOnly, setAudioOnly] = useState(false);
   const [isFavorite, setIsFavorite] = useState(false);
   const [favId, setFavId] = useState<number | null>(null);
-  const [lanUrl, setLanUrl] = useState("");
+  const [lanShareOpen, setLanShareOpen] = useState(false);
+  const lanUrl = window.location.href;
   const { isAuthenticated, authHeaders } = useAuth();
   const { t } = useLang();
-
-  useEffect(() => { setLanUrl(window.location.href); }, [id]);
 
   const { data: video, isLoading: loadingVideo } = useVideo(id);
   const { data: streamUrl, isLoading: loadingStream } = useStreamUrl(id);
@@ -149,21 +147,22 @@ export default function VideoPage() {
               <Button variant={isFavorite ? "default" : "secondary"} size="sm" className="rounded-full gap-2" onClick={toggleFavorite}>
                 <Heart className={cn("w-4 h-4", isFavorite && "fill-current")} /> {isFavorite ? t.saved : t.save}
               </Button>
-              <Button variant="secondary" size="sm" className="rounded-full gap-2">
+              <Button variant="secondary" size="sm" className="rounded-full gap-2" onClick={() => {
+                if (navigator.share) navigator.share({ url: lanUrl, title: video?.title });
+                else navigator.clipboard?.writeText(lanUrl);
+              }}>
                 <Share2 className="w-4 h-4" /> {t.share}
               </Button>
-              <Dialog>
-                <DialogTrigger asChild>
-                  <Button variant="outline" size="sm" className="rounded-full gap-2"><QrCode className="w-4 h-4" /> {t.lanShare}</Button>
-                </DialogTrigger>
-                <DialogContent className="sm:max-w-md bg-card border-border">
-                  <DialogHeader><DialogTitle>{t.lanShare}</DialogTitle></DialogHeader>
-                  <div className="flex flex-col items-center p-6 space-y-4">
-                    <div className="p-4 bg-white rounded-xl"><QRCodeSVG value={lanUrl} size={200} /></div>
-                    <code className="bg-muted px-2 py-1 rounded text-xs break-all max-w-full">{lanUrl}</code>
-                  </div>
-                </DialogContent>
-              </Dialog>
+              <Button variant="outline" size="sm" className="rounded-full gap-2" onClick={() => setLanShareOpen(true)}>
+                <Wifi className="w-4 h-4" /> LAN P2P
+              </Button>
+              {lanShareOpen && (
+                <LANShareDialog
+                  videoUrl={lanUrl}
+                  videoTitle={video?.title}
+                  onClose={() => setLanShareOpen(false)}
+                />
+              )}
             </div>
           </div>
 

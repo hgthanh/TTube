@@ -1,4 +1,5 @@
 import { Layout } from "@/components/layout/Layout";
+import { updateLANDeviceName } from "@/components/video/LANShare";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -8,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { useState, useEffect, useRef } from "react";
 import {
   Globe, Shield, Zap, Plus, X, Download, Upload,
-  Check, RefreshCw, Loader2, CheckCircle2, Clock, LogIn, User,
+  Check, RefreshCw, Loader2, CheckCircle2, Clock, LogIn, User, Wifi,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/contexts/AuthContext";
@@ -36,6 +37,9 @@ export default function Settings() {
   // Prevent saveSettings from firing during initial data load
   const initialized = useRef(false);
 
+  const [lanDeviceName, setLanDeviceName] = useState(
+    () => localStorage.getItem("lan_device_name") || ""
+  );
   const [proxyEnabled, setProxyEnabled] = useState(true);
   const [customProxy, setCustomProxy] = useState("");
   const [activeProxy, setActiveProxy] = useState("");
@@ -259,6 +263,46 @@ export default function Settings() {
                 </div>
               </div>
             )}
+          </CardContent>
+        </Card>
+
+        {/* ── LAN Device Name ───────────────────────────────────── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Wifi className="h-5 w-5 text-primary" /> Chia sẻ qua mạng LAN
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <Label className="font-medium">Tên thiết bị của bạn</Label>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Tên này hiển thị với thiết bị khác khi bạn chia sẻ video qua LAN P2P.
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Input
+                value={lanDeviceName}
+                onChange={e => setLanDeviceName(e.target.value)}
+                placeholder="Ví dụ: 💻 MacBook của tôi"
+                className="flex-1"
+              />
+              <Button
+                variant="outline"
+                onClick={() => {
+                  const name = lanDeviceName.trim() || "Thiết bị";
+                  setLanDeviceName(name);
+                  updateLANDeviceName(name);
+                  toast({ title: "Đã lưu tên thiết bị", description: name });
+                }}
+              >
+                <Check className="h-4 w-4 mr-1" /> Lưu
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
+              Thiết bị đang hoạt động và có thể nhận video được chia sẻ.
+            </p>
           </CardContent>
         </Card>
 

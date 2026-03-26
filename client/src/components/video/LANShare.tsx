@@ -31,6 +31,13 @@ let myDeviceName: string = localStorage.getItem("lan_device_name") || (() => {
   return name;
 })();
 
+/** Called from Settings to update the device name globally */
+export function updateLANDeviceName(name: string): void {
+  myDeviceName = name;
+  localStorage.setItem("lan_device_name", name);
+  registerDevice().catch(() => {});
+}
+
 async function registerDevice(): Promise<void> {
   try {
     const res = await fetch("/api/lan/register", {
@@ -267,7 +274,6 @@ export function LANShareDialog({ videoUrl, videoTitle, onClose }: LANShareDialog
   const [devices, setDevices] = useState<LANDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<Record<string, string>>({});
-  const [deviceName, setDeviceName] = useState(myDeviceName);
 
   const fetchDevices = useCallback(async () => {
     setLoading(true);
@@ -290,12 +296,6 @@ export function LANShareDialog({ videoUrl, videoTitle, onClose }: LANShareDialog
     setTimeout(() => setStatus(s => { const n = { ...s }; delete n[device.id]; return n; }), 3000);
   };
 
-  const saveName = () => {
-    myDeviceName = deviceName;
-    localStorage.setItem("lan_device_name", deviceName);
-    registerDevice();
-  };
-
   const getIcon = (name: string) =>
     name.includes("📱") ? Smartphone : name.includes("📟") ? Tablet : Monitor;
 
@@ -314,7 +314,7 @@ export function LANShareDialog({ videoUrl, videoTitle, onClose }: LANShareDialog
             </div>
             <div>
               <h2 className="font-semibold text-sm">Chia sẻ qua LAN (P2P)</h2>
-              <p className="text-xs text-muted-foreground">Trực tiếp không qua server</p>
+              <p className="text-xs text-muted-foreground">Bạn: <span className="text-foreground font-medium">{myDeviceName}</span></p>
             </div>
           </div>
           <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
@@ -326,18 +326,6 @@ export function LANShareDialog({ videoUrl, videoTitle, onClose }: LANShareDialog
         <div className="px-5 py-3 bg-secondary/30 border-b border-border">
           <p className="text-xs text-muted-foreground">Video:</p>
           <p className="text-sm font-medium line-clamp-1 mt-0.5">{videoTitle || videoUrl}</p>
-        </div>
-
-        {/* Device name */}
-        <div className="px-5 pt-4 pb-2">
-          <p className="text-xs text-muted-foreground mb-1.5">Tên thiết bị của bạn</p>
-          <input
-            value={deviceName}
-            onChange={e => setDeviceName(e.target.value)}
-            onBlur={saveName}
-            onKeyDown={e => e.key === "Enter" && saveName()}
-            className="w-full h-8 px-3 text-sm bg-secondary rounded-lg border border-border focus:outline-none focus:ring-1 focus:ring-primary/50"
-          />
         </div>
 
         {/* Devices */}
