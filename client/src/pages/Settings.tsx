@@ -1,5 +1,6 @@
 import { Layout } from "@/components/layout/Layout";
 import { updateLANDeviceName } from "@/components/video/LANShare";
+import { usePushNotifications } from "@/hooks/usePushNotifications";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -9,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { useState, useEffect, useRef } from "react";
 import {
   Globe, Shield, Zap, Plus, X, Download, Upload,
-  Check, RefreshCw, Loader2, CheckCircle2, Clock, LogIn, User, Wifi,
+  Check, RefreshCw, Loader2, CheckCircle2, Clock, LogIn, User, Wifi, Youtube, Trash2, Bell,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/contexts/AuthContext";
@@ -37,6 +38,10 @@ export default function Settings() {
   // Prevent saveSettings from firing during initial data load
   const initialized = useRef(false);
 
+  const [ytCookie, setYtCookie] = useState("");
+  const [hasCookie, setHasCookie] = useState(false);
+  const [savingCookie, setSavingCookie] = useState(false);
+  const { permission, subscribed, loading: pushLoading, subscribe: subscribePush, unsubscribe: unsubscribePush } = usePushNotifications(authHeaders);
   const [lanDeviceName, setLanDeviceName] = useState(
     () => localStorage.getItem("lan_device_name") || ""
   );
@@ -73,6 +78,13 @@ export default function Settings() {
       setLoadingProxies(false);
     }
   };
+
+  // Load YT cookie status
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    fetch("/api/settings/yt-cookie/status", { headers: authHeaders() })
+      .then(r => r.json()).then(d => setHasCookie(!!d.hasCookie)).catch(() => {});
+  }, [isAuthenticated]);
 
   // Load settings from API if authenticated, else localStorage
   useEffect(() => {
@@ -266,7 +278,42 @@ export default function Settings() {
           </CardContent>
         </Card>
 
-        {/* ── LAN Device Name ───────────────────────────────────── */}
+        {/* ── Push Notifications ────────────────────────────── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Bell className="h-5 w-5 text-primary" /> Thông báo đẩy
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Nhận thông báo khi có video mới từ kênh yêu thích (cần đăng nhập TTube).
+            </p>
+            {permission === "denied" ? (
+              <p className="text-sm text-destructive">Trình duyệt đã chặn thông báo. Vui lòng cho phép trong cài đặt trình duyệt.</p>
+            ) : subscribed ? (
+              <div className="flex items-center justify-between p-3 bg-primary/10 border border-primary/20 rounded-xl">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-5 w-5 text-primary shrink-0" />
+                  <p className="text-sm font-medium">Đã bật thông báo</p>
+                </div>
+                <Button variant="outline" size="sm" onClick={unsubscribePush} disabled={pushLoading}>
+                  {pushLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Tắt"}
+                </Button>
+              </div>
+            ) : (
+              <Button className="w-full gap-2" onClick={subscribePush}
+                disabled={pushLoading || !isAuthenticated}>
+                {pushLoading
+                  ? <><Loader2 className="h-4 w-4 animate-spin" /> Đang bật...</>
+                  : <><Bell className="h-4 w-4" /> Bật thông báo</>}
+              </Button>
+            )}
+            {!isAuthenticated && <p className="text-xs text-muted-foreground text-center">Cần đăng nhập tài khoản TTube.</p>}
+          </CardContent>
+        </Card>
+
+                {/* ── LAN Device Name ───────────────────────────────────── */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -303,6 +350,82 @@ export default function Settings() {
               <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
               Thiết bị đang hoạt động và có thể nhận video được chia sẻ.
             </p>
+          </CardContent>
+        </Card>
+
+        {/* ── YouTube Account ───────────────────────────────────── */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Youtube className="h-5 w-5 text-red-500" /> Tài khoản YouTube
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Đăng nhập bằng cookie để sử dụng Like, Dislike, Đăng ký, Bình luận.
+              Cookie được mã hóa AES-256 trước khi lưu.
+            </p>
+
+            {hasCookie ? (
+              <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/20 rounded-xl">
+                <CheckCircle2 className="h-5 w-5 text-green-500 shrink-0" />
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-green-400">Cookie đã được lưu</p>
+                  <p className="text-xs text-muted-foreground">Bạn có thể Like, Dislike, Subscribe, Comment.</p>
+                </div>
+                <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive gap-1"
+                  onClick={async () => {
+                    await fetch("/api/settings/yt-cookie", { method: "DELETE", headers: authHeaders() });
+                    setHasCookie(false);
+                    toast({ title: "Đã xóa cookie" });
+                  }}>
+                  <Trash2 className="h-4 w-4" /> Xóa
+                </Button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div>
+                  <Label className="font-medium text-sm">Cookie từ youtube.com</Label>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Mở F12 → Network → Chọn request tới youtube.com → Copy header <code className="bg-muted px-1 rounded">Cookie</code>
+                  </p>
+                </div>
+                <textarea
+                  className="w-full h-24 px-3 py-2 text-xs bg-secondary border border-border rounded-lg resize-none focus:outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                  placeholder="Dán cookie vào đây..."
+                  value={ytCookie}
+                  onChange={e => setYtCookie(e.target.value)}
+                />
+                <Button
+                  className="w-full gap-2"
+                  disabled={!ytCookie.trim() || savingCookie || !isAuthenticated}
+                  onClick={async () => {
+                    setSavingCookie(true);
+                    try {
+                      const res = await fetch("/api/settings/yt-cookie", {
+                        method: "POST",
+                        headers: { ...authHeaders(), "Content-Type": "application/json" },
+                        body: JSON.stringify({ cookie: ytCookie.trim() }),
+                      });
+                      if (res.ok) {
+                        setHasCookie(true);
+                        setYtCookie("");
+                        toast({ title: "✅ Đã lưu cookie", description: "Cookie được mã hóa và lưu an toàn." });
+                      } else {
+                        const d = await res.json();
+                        toast({ title: "Lỗi: " + (d.message || "Thất bại"), variant: "destructive" });
+                      }
+                    } catch { toast({ title: "Lỗi kết nối", variant: "destructive" }); }
+                    setSavingCookie(false);
+                  }}
+                >
+                  {savingCookie ? <><Loader2 className="h-4 w-4 animate-spin" /> Đang lưu...</> : <><Check className="h-4 w-4" /> Lưu cookie</>}
+                </Button>
+                {!isAuthenticated && (
+                  <p className="text-xs text-muted-foreground text-center">Cần đăng nhập tài khoản TTube trước.</p>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 

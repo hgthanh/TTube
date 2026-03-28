@@ -50,6 +50,7 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
   const containerRef = useRef<HTMLDivElement>(null);
   const ytPlayerRef = useRef<any>(null);          // YT.Player instance
   const hideTimer   = useRef<ReturnType<typeof setTimeout>>();
+  const holdTimer   = useRef<ReturnType<typeof setTimeout>>();
   const embedDivId  = `yt-embed-${uid}`;
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -66,6 +67,8 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
   const [currentTime, setCurrentTime]   = useState(0);
   const [duration, setDuration]         = useState(0);
   const [ytReady, setYtReady]           = useState(false);
+  const [holdSpeed, setHoldSpeed]       = useState(false); // hold-to-2x
+  const holdTimer = useRef<ReturnType<typeof setTimeout>>();
 
   // Use embed when no native stream URL
   const useEmbed = !url || hasError;
@@ -170,6 +173,25 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
     hideTimer.current = setTimeout(() => setShowControls(false), 3000);
   }, []);
 
+  // Hold-to-2x speed (pointer events for both mouse and touch)
+  const startHold = useCallback(() => {
+    holdTimer.current = setTimeout(() => {
+      setHoldSpeed(true);
+      if (useEmbed) ytPlayerRef.current?.setPlaybackRate(2);
+      else if (videoRef.current) videoRef.current.playbackRate = 2;
+    }, 400); // 400ms hold threshold
+  }, [useEmbed]);
+
+  const endHold = useCallback(() => {
+    clearTimeout(holdTimer.current);
+    if (holdSpeed) {
+      setHoldSpeed(false);
+      const s = parseFloat(playbackSpeed);
+      if (useEmbed) ytPlayerRef.current?.setPlaybackRate(s);
+      else if (videoRef.current) videoRef.current.playbackRate = s;
+    }
+  }, [holdSpeed, playbackSpeed, useEmbed]);
+
   // ── Unified controls (work for both native + embed) ───────────────────────
   const togglePlay = useCallback(() => {
     if (useEmbed) {
@@ -235,6 +257,15 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
   }, [useEmbed]);
 
   // ── Full controls bar (shared between embed and native) ───────────────────
+  // ── Hold speed indicator ─────────────────────────────────────────────────────
+  const HoldIndicator = holdSpeed ? (
+    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none">
+      <div className="bg-black/70 text-white rounded-xl px-4 py-2 flex items-center gap-2 text-sm font-bold">
+        <span>⚡</span> 2× tốc độ
+      </div>
+    </div>
+  ) : null;
+
   const ControlsBar = (
     <div className={`absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent flex flex-col justify-end p-4 transition-opacity duration-300 ${showControls || !isPlaying ? "opacity-100" : "opacity-0"}`}
       style={{ pointerEvents: showControls || !isPlaying ? "auto" : "none" }}>
@@ -337,6 +368,9 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
         className="relative aspect-video w-full rounded-xl overflow-hidden bg-black shadow-2xl ring-1 ring-white/10"
         onMouseMove={showControlsTemporarily}
         onMouseLeave={() => { clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => setShowControls(false), 1500); }}
+        onPointerDown={startHold}
+        onPointerUp={endHold}
+        onPointerLeave={endHold}
       >
         {/* YT API mounts the iframe into this div */}
         <div id={embedDivId} className="absolute inset-0 w-full h-full" />
@@ -355,6 +389,9 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
           onClick={togglePlay}
         />
 
+        {/* Hold speed indicator */}
+        {HoldIndicator}
+
         {/* Controls bar — rendered above click overlay */}
         <div className="absolute inset-0 z-30 pointer-events-none">
           <div style={{ pointerEvents: "none" }} className="relative h-full">
@@ -371,7 +408,10 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
       ref={containerRef}
       className="group relative w-full rounded-xl overflow-hidden bg-black aspect-video ring-1 ring-white/10 shadow-2xl"
       onMouseMove={showControlsTemporarily}
-      onMouseLeave={() => { clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => setShowControls(false), 1000); }}
+      onMouseLeave={() => { clearTimeout(hideTimer.current); hideTimer.current = setTimeout(() => setShowControls(false), 1000); endHold(); }}
+      onPointerDown={startHold}
+      onPointerUp={endHold}
+      onPointerLeave={endHold}
     >
       <video
         ref={videoRef} src={url} poster={thumbnail} autoPlay
@@ -391,6 +431,7 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
         </div>
       )}
 
+      {HoldIndicator}
       {ControlsBar}
 
       {audioOnly && (

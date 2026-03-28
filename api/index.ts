@@ -9,6 +9,7 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
 
 
 // ─── Silence ALL youtubei.js logs ──────────────────────────────────────────────
@@ -42,6 +43,30 @@ const DB_CONFIG = {
   connectionLimit: 5,
   timezone: "+00:00",
 };
+
+
+// ─── Cookie encryption (AES-256-GCM) ─────────────────────────────────────────
+// Cookies contain session tokens — encrypt at rest in the DB.
+const COOKIE_KEY = Buffer.from(
+  (process.env.COOKIE_ENC_KEY || JWT_SECRET).slice(0, 32).padEnd(32, "0")
+);
+function encryptCookie(plain: string): string {
+  const iv  = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", COOKIE_KEY, iv);
+  const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv.toString("hex"), enc.toString("hex"), tag.toString("hex")].join(".");
+}
+function decryptCookie(stored: string): string | null {
+  try {
+    const [ivHex, encHex, tagHex] = stored.split(".");
+    if (!ivHex || !encHex || !tagHex) return null;
+    const decipher = createDecipheriv("aes-256-gcm", COOKIE_KEY, Buffer.from(ivHex, "hex"));
+    decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+    const dec = Buffer.concat([decipher.update(Buffer.from(encHex, "hex")), decipher.final()]);
+    return dec.toString("utf8");
+  } catch { return null; }
+}
 
 // ─── MySQL pool (lazy-init) ───────────────────────────────────────────────────
 let pool: mysql.Pool | null = null;
@@ -96,6 +121,17 @@ async function initDB() {
       proxy_enabled TINYINT(1) DEFAULT 1,
       user_keywords JSON,
       language VARCHAR(10) DEFAULT 'en',
+      yt_cookie TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    await query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      endpoint TEXT NOT NULL,
+      p256dh TEXT,
+      auth TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
@@ -235,6 +271,27 @@ async function getYoutube(): Promise<Innertube> {
   youtubeProxy = proxyUrl;
   youtubeCreatedAt = Date.now();
   return youtube;
+}
+
+
+// ─── Innertube with optional YouTube cookie ──────────────────────────────────
+// Returns an Innertube instance authenticated with the user's YT cookie if set.
+async function getYoutubeForUser(userId?: number): Promise<Innertube> {
+  if (!userId) return getYoutube();
+  try {
+    const rows = await query<any>("SELECT yt_cookie FROM settings WHERE user_id=?", [userId]);
+    const enc = rows[0]?.yt_cookie;
+    if (!enc) return getYoutube();
+    const cookie = decryptCookie(enc);
+    if (!cookie) return getYoutube();
+    const proxyUrl = getWorkingProxy();
+    const options: any = { cookie, generate_session_locally: true };
+    if (proxyUrl) options.fetch = makeProxyFetch(proxyUrl);
+    return await Promise.race([
+      Innertube.create(options),
+      new Promise<never>((_, r) => setTimeout(() => r(new Error("timeout")), 20000)),
+    ]);
+  } catch { return getYoutube(); }
 }
 
 function invalidateSession(reason?: string) {
@@ -961,9 +1018,136 @@ app.delete("/api/history", authMiddleware, async (req, res) => {
 });
 
 // ── Settings (auth required) ──────────────────────────────────────────────────
+
+// ── YouTube cookie (save encrypted / delete) ──────────────────────────────────
+app.post("/api/settings/yt-cookie", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { cookie } = z.object({ cookie: z.string().min(10) }).parse(req.body);
+    const encrypted = encryptCookie(cookie.trim());
+    await getPool().execute(
+      "INSERT INTO settings (user_id, yt_cookie) VALUES (?,?) ON DUPLICATE KEY UPDATE yt_cookie=VALUES(yt_cookie)",
+      [userId, encrypted]
+    );
+    res.json({ ok: true });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) return res.status(400).json({ message: "Invalid cookie" });
+    console.error("Save cookie:", err.message);
+    res.status(500).json({ message: "Failed to save cookie" });
+  }
+});
+
+app.delete("/api/settings/yt-cookie", authMiddleware, async (req, res) => {
+  const { userId } = (req as any).user;
+  await getPool().execute("UPDATE settings SET yt_cookie=NULL WHERE user_id=?", [userId]);
+  res.json({ ok: true });
+});
+
+app.get("/api/settings/yt-cookie/status", authMiddleware, async (req, res) => {
+  const { userId } = (req as any).user;
+  const rows = await query<any>("SELECT yt_cookie IS NOT NULL AS has_cookie FROM settings WHERE user_id=?", [userId]);
+  res.json({ hasCookie: !!rows[0]?.has_cookie });
+});
+
+// ── YouTube authenticated actions (like, dislike, subscribe, comment) ─────────
+app.post("/api/yt/like/:videoId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const yt = await getYoutubeForUser(userId);
+    const info = await yt.getInfo(req.params.videoId);
+    await info.like();
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/yt/dislike/:videoId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const yt = await getYoutubeForUser(userId);
+    const info = await yt.getInfo(req.params.videoId);
+    await info.dislike();
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/yt/like/:videoId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const yt = await getYoutubeForUser(userId);
+    const info = await yt.getInfo(req.params.videoId);
+    await info.removeLike();
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/yt/subscribe/:channelId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const yt = await getYoutubeForUser(userId);
+    const ch = await yt.getChannel(req.params.channelId);
+    await (ch as any).subscribe();
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.delete("/api/yt/subscribe/:channelId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const yt = await getYoutubeForUser(userId);
+    const ch = await yt.getChannel(req.params.channelId);
+    await (ch as any).unsubscribe();
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/yt/comment/:videoId", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { text } = z.object({ text: z.string().min(1).max(2000) }).parse(req.body);
+    const yt = await getYoutubeForUser(userId);
+    const info = await yt.getInfo(req.params.videoId);
+    await (info as any).comment(text);
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Infinite scroll: search with continuation ─────────────────────────────────
+app.get("/api/yt/search/more", async (req, res) => {
+  try {
+    const { token } = req.query as { token: string };
+    if (!token) return res.status(400).json({ message: "Missing token" });
+    const yt = await getYoutube();
+    const results = await (yt as any).actions.execute("/search", {
+      continuation: token,
+      parse: true,
+    });
+    const items = (results?.on_response_received_commands?.[0]?.append_continuation_items_action?.continuation_items ?? [])
+      .map((v: any) => {
+        const vr = v.video_renderer || v;
+        return {
+          id: vr.video_id || vr.id,
+          title: vr.title?.text || vr.title?.runs?.[0]?.text || "",
+          thumbnail: vr.thumbnails?.slice(-1)?.[0]?.url || vr.thumbnail?.thumbnails?.slice(-1)?.[0]?.url || "",
+          channelTitle: vr.short_byline_text?.runs?.[0]?.text || vr.author?.name || "",
+          channelId: vr.author?.id || "",
+          viewCount: vr.short_view_count_text?.text || vr.view_count?.text || "",
+          publishedTime: vr.published_time_text?.text || vr.published?.text || "",
+          lengthSeconds: String(vr.length_text?.text ? vr.length_text.text.split(":").reduce((a: number, v: string, i: number, arr: string[]) => a + parseInt(v) * Math.pow(60, arr.length - 1 - i), 0) : 0),
+          isShort: !!vr.is_short,
+        };
+      }).filter((v: any) => v.id && v.title);
+
+    const nextToken = results?.on_response_received_commands?.[0]?.append_continuation_items_action?.continuation_items?.slice(-1)?.[0]?.continuation_item_renderer?.continuation_endpoint?.continuation_command?.token || null;
+    res.json({ items, nextToken });
+  } catch (err: any) {
+    console.error("Search more:", err.message);
+    res.status(500).json({ message: "Failed" });
+  }
+});
+
 app.get("/api/settings", authMiddleware, async (req, res) => {
   const {userId} = (req as any).user;
-  const rows = await query<any>("SELECT * FROM settings WHERE user_id=?", [userId]);
+  const rows = await query<any>("SELECT custom_proxy,proxy_enabled,user_keywords,language FROM settings WHERE user_id=?", [userId]);
   res.json(rows[0] || {});
 });
 
@@ -975,3 +1159,27 @@ app.put("/api/settings", authMiddleware, async (req, res) => {
 });
 
 export default app;
+
+// ── Push notification subscriptions ──────────────────────────────────────────
+app.post("/api/push/subscribe", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { endpoint, keys } = req.body;
+    if (!endpoint) return res.status(400).json({ message: "Missing endpoint" });
+    await getPool().execute(
+      "INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE p256dh=VALUES(p256dh), auth=VALUES(auth)",
+      [userId, endpoint, keys?.p256dh || null, keys?.auth || null]
+    );
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+app.post("/api/push/unsubscribe", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { endpoint } = req.body;
+    await query("DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?", [userId, endpoint]);
+    res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+

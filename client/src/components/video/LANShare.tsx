@@ -162,69 +162,79 @@ export function LANNotification() {
   const [, setLocation] = useLocation();
   const [notification, setNotification] = useState<{ videoUrl: string; from: string; p2p?: boolean } | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
+  const [ready, setReady] = useState(false);
+
+  // Wait for device registration before polling
+  useEffect(() => {
+    const waitForId = setInterval(() => {
+      if (myDeviceId) { setReady(true); clearInterval(waitForId); }
+    }, 500);
+    return () => clearInterval(waitForId);
+  }, []);
 
   useEffect(() => {
+    if (!ready) return;
     let active = true;
-    const checkP2P = async () => {
-      if (!myDeviceId || !active) return;
 
-      // Check for WebRTC offer
+    const handleOffer = async (offerData: any) => {
+      const { sdp, candidates, fromName } = offerData;
+      try {
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        pcRef.current = pc;
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        for (const c of candidates || []) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch {}
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await new Promise<void>(resolve => {
+          const t = setTimeout(resolve, 3000);
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); }
+          };
+        });
+        const offerId = offerData.fromId || offerData.from;
+        await sendSignal(offerId || "", "answer", { sdp: pc.localDescription, candidates: [] });
+        pc.ondatachannel = e => {
+          e.channel.onmessage = msg => {
+            try {
+              const data = JSON.parse(msg.data);
+              if (data.type === "video" && active) {
+                setNotification({ videoUrl: data.url, from: data.from || fromName || "Someone", p2p: true });
+              }
+            } catch {}
+          };
+        };
+      } catch (err) {
+        console.warn("[LAN] WebRTC answer failed:", err);
+      }
+    };
+
+    const poll = async () => {
+      if (!myDeviceId || !active) return;
+      // Check WebRTC offer
       const offerData = await pollSignal("offer");
       if (offerData && active) {
-        const { sdp, candidates, fromName } = offerData;
-        try {
-          const pc = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-          });
-          pcRef.current = pc;
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-          for (const c of candidates || []) await pc.addIceCandidate(new RTCIceCandidate(c));
-
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          // Gather candidates
-          await new Promise<void>(resolve => {
-            const t = setTimeout(resolve, 3000);
-            pc.onicegatheringstatechange = () => {
-              if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); }
-            };
-          });
-
-          const ansCandidates: RTCIceCandidate[] = [];
-          // Send answer to the offerer
-          const offerId = offerData.fromId || (offerData as any).from;
-          await sendSignal(offerId || "", "answer", {
-            sdp: pc.localDescription,
-            candidates: ansCandidates,
-          });
-
-          pc.ondatachannel = e => {
-            e.channel.onmessage = msg => {
-              try {
-                const data = JSON.parse(msg.data);
-                if (data.type === "video") {
-                  setNotification({ videoUrl: data.url, from: data.from, p2p: true });
-                }
-              } catch {}
-            };
-          };
-        } catch {}
+        handleOffer(offerData);
       }
-
-      // Check server-relay push (fallback)
+      // Check server-relay push
       try {
         const res = await fetch(`/api/lan/poll/${myDeviceId}`);
+        if (!res.ok) return;
         const data = await res.json();
         if (data.videoUrl && active) {
-          setNotification({ videoUrl: data.videoUrl, from: data.from, p2p: false });
+          setNotification({ videoUrl: data.videoUrl, from: data.from || "Someone", p2p: false });
         }
       } catch {}
     };
 
-    const interval = setInterval(checkP2P, 5000);
+    // Poll immediately then every 5s
+    poll();
+    const interval = setInterval(poll, 5000);
     return () => { active = false; clearInterval(interval); pcRef.current?.close(); };
-  }, []);
+  }, [ready]);
 
   if (!notification) return null;
 

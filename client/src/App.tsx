@@ -25,7 +25,7 @@ import { LANNotification } from "@/components/video/LANShare";
 function Router() {
   return (
     <Switch>
-      <Route path="/"><Redirect to="/home" /></Route>
+      <Route path="/">{() => <Redirect to="/home" />}</Route>
       <Route path="/home" component={Home} />
       <Route path="/shorts" component={Shorts} />
       <Route path="/trending" component={TrendingPage} />
@@ -52,6 +52,7 @@ export default function App() {
         <AuthProvider>
           <TooltipProvider>
             <Toaster />
+            <LANNotification />
             <Router />
           </TooltipProvider>
         </AuthProvider>
