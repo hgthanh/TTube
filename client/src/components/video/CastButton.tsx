@@ -3,7 +3,7 @@
  * Clicking opens the device picker. When connected, shows device name + stop button.
  */
 import { useState } from "react";
-import { Tv2, Cast, CastConnected, Loader2 } from "lucide-react";
+import { Tv2, Cast, X, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { CastState } from "@/hooks/useChromecast";
@@ -33,7 +33,7 @@ export function CastButton({ castState, deviceName, available, onStart, onStop, 
           onClick={onStop}
           title="Ngắt kết nối Cast"
         >
-          <CastConnected className="h-4 w-4" />
+          <X className="h-4 w-4" />
         </Button>
       </div>
     );
