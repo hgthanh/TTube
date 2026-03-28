@@ -12,11 +12,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Slider } from "@/components/ui/slider";
 import { useLang } from "@/contexts/LangContext";
+import { useChromecast } from "@/hooks/useChromecast";
+import { CastButton } from "./CastButton";
+import { CastOverlay } from "./CastOverlay";
 
 interface SubtitleTrack { label: string; languageCode: string; url: string; }
 interface VideoPlayerProps {
   url?: string; thumbnail?: string; isLoading: boolean;
   audioOnly?: boolean; videoId?: string;
+  videoTitle?: string;
 }
 
 // ── YouTube IFrame Player API types ──────────────────────────────────────────
@@ -41,7 +45,7 @@ function loadYTAPI(): Promise<void> {
   });
 }
 
-export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, videoId }: VideoPlayerProps) {
+export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, videoId, videoTitle }: VideoPlayerProps) {
   const { t } = useLang();
   const uid = useId().replace(/:/g, "");
 
@@ -67,6 +71,37 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
   const [currentTime, setCurrentTime]   = useState(0);
   const [duration, setDuration]         = useState(0);
   const [ytReady, setYtReady]           = useState(false);
+
+  // ── Chromecast ─────────────────────────────────────────────────────────────
+  const {
+    available: castAvailable,
+    castState,
+    connected: castConnected,
+    deviceName: castDeviceName,
+    startCast,
+    stopCast,
+    loadMedia: castLoadMedia,
+    seekTo: castSeekTo,
+    setRemoteVolume,
+    remoteCurrentTime,
+    remoteDuration,
+    remotePlaying,
+  } = useChromecast();
+
+  // When cast connects and we have a stream URL, load it automatically
+  useEffect(() => {
+    if (!castConnected || !url) return;
+    castLoadMedia({
+      url,
+      title: videoTitle || videoId || "Video",
+      thumbnail,
+      contentType: "video/mp4",
+    }).catch(() => {});
+    // Pause local player while casting
+    if (!useEmbed) videoRef.current?.pause();
+    else ytPlayerRef.current?.pauseVideo();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [castConnected]);
   const [holdSpeed, setHoldSpeed]       = useState(false); // hold-to-2x
   const holdTimer = useRef<ReturnType<typeof setTimeout>>();
 
@@ -331,6 +366,16 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
               </DropdownMenuContent>
             </DropdownMenu>
 
+            {/* Cast button */}
+            <CastButton
+              castState={castState}
+              deviceName={castDeviceName}
+              available={castAvailable}
+              onStart={startCast}
+              onStop={stopCast}
+              className=""
+            />
+
             {/* PiP */}
             <Button variant="ghost" size="icon"
               className={`h-9 w-9 text-white hover:bg-white/20 ${isPiP ? "text-primary" : ""}`}
@@ -347,6 +392,38 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
       </div>
     </div>
   );
+
+  // ── Cast overlay (shown when actively casting) ───────────────────────────
+  if (castConnected) {
+    const handleCastPlayPause = () => {
+      const session = (window as any).cast?.framework?.CastContext?.getInstance()?.getCurrentSession();
+      const media = session?.getMediaSession?.();
+      if (!media) return;
+      if (remotePlaying) {
+        media.pause(null, null, null);
+      } else {
+        media.play(null, null, null);
+      }
+    };
+
+    return (
+      <CastOverlay
+        thumbnail={thumbnail}
+        title={videoTitle}
+        castState={castState}
+        deviceName={castDeviceName}
+        available={castAvailable}
+        playing={remotePlaying}
+        currentTime={remoteCurrentTime}
+        duration={remoteDuration}
+        onPlayPause={handleCastPlayPause}
+        onSeek={castSeekTo}
+        onVolume={setRemoteVolume}
+        onStop={stopCast}
+        onStart={startCast}
+      />
+    );
+  }
 
   // ── Loading ───────────────────────────────────────────────────────────────
   if (isLoading) {

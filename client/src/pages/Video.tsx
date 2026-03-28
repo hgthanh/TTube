@@ -165,6 +165,7 @@ export default function VideoPage() {
             isLoading={loadingVideo || loadingStream}
             audioOnly={audioOnly}
             videoId={id}
+            videoTitle={video?.title}
           />
 
           {/* Title */}
