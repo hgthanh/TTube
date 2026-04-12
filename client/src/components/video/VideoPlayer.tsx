@@ -71,6 +71,7 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
   const [currentTime, setCurrentTime]   = useState(0);
   const [duration, setDuration]         = useState(0);
   const [ytReady, setYtReady]           = useState(false);
+  const [holdSpeed, setHoldSpeed]       = useState(false); // hold-to-2x
 
   // ── Chromecast ─────────────────────────────────────────────────────────────
   const {
@@ -102,8 +103,6 @@ export function VideoPlayer({ url, thumbnail, isLoading, audioOnly = false, vide
     else ytPlayerRef.current?.pauseVideo();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [castConnected]);
-  const [holdSpeed, setHoldSpeed]       = useState(false); // hold-to-2x
-  const holdTimer = useRef<ReturnType<typeof setTimeout>>();
 
   // Use embed when no native stream URL
   const useEmbed = !url || hasError;
