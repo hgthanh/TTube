@@ -75,7 +75,6 @@ export default function VideoPage() {
   }, [isAuthenticated, hasCookie, video?.channelId]);
 
   // Auto-cast when cast session connects and we have a stream
-  const { data: streamUrl } = { data: null as string | null | undefined }; // placeholder ref
   useEffect(() => {
     if (!castConnected) return;
     const su = (window as any).__ttube_stream_url;
