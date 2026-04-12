@@ -9,7 +9,7 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
+import { createCipheriv, createDecipheriv, randomBytes, createHmac } from "crypto";
 
 
 // ─── Silence ALL youtubei.js logs ──────────────────────────────────────────────
@@ -33,6 +33,15 @@ Platform.shim.eval = async (
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || "ttube-secret-change-in-prod";
+
+// ─── Google OAuth 2.0 ────────────────────────────────────────────────────────
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI  = process.env.GOOGLE_REDIRECT_URI  || "";
+const YOUTUBE_SCOPES = [
+  "https://www.googleapis.com/auth/youtube",
+  "https://www.googleapis.com/auth/youtube.force-ssl",
+].join(" ");
 const DB_CONFIG = {
   host: process.env.MYSQL_HOST || "localhost",
   port: Number(process.env.MYSQL_PORT || 3306),
@@ -122,8 +131,20 @@ async function initDB() {
       user_keywords JSON,
       language VARCHAR(10) DEFAULT 'en',
       yt_cookie TEXT,
+      yt_access_token TEXT,
+      yt_refresh_token TEXT,
+      yt_token_expiry BIGINT DEFAULT 0,
+      yt_account_name VARCHAR(255),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    // Migration: add OAuth columns if they don't exist yet (idempotent)
+    await Promise.allSettled([
+      query(`ALTER TABLE settings ADD COLUMN yt_access_token TEXT`),
+      query(`ALTER TABLE settings ADD COLUMN yt_refresh_token TEXT`),
+      query(`ALTER TABLE settings ADD COLUMN yt_token_expiry BIGINT DEFAULT 0`),
+      query(`ALTER TABLE settings ADD COLUMN yt_account_name VARCHAR(255)`),
+    ]);
 
     await query(`CREATE TABLE IF NOT EXISTS push_subscriptions (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -151,9 +172,92 @@ function signToken(userId: number, username: string) {
 function verifyToken(token: string): { userId: number; username: string } | null {
   try {
     return jwt.verify(token, JWT_SECRET) as any;
-  } catch {
-    return null;
+  } catch { return null; }
+}
+
+// ─── Google OAuth 2.0 helpers ─────────────────────────────────────────────────
+
+/** Create a short-lived, signed state param to prevent CSRF in the OAuth flow */
+function makeOAuthState(userId: number): string {
+  const ts   = Date.now().toString();
+  const data = `${userId}.${ts}`;
+  const sig  = createHmac("sha256", JWT_SECRET).update(data).digest("hex").slice(0, 16);
+  return Buffer.from(`${data}.${sig}`).toString("base64url");
+}
+
+/** Returns userId from a valid state, or null if tampered / expired (10 min) */
+function verifyOAuthState(state: string): number | null {
+  try {
+    const decoded = Buffer.from(state, "base64url").toString();
+    const parts   = decoded.split(".");
+    if (parts.length !== 3) return null;
+    const [userIdStr, ts, sig] = parts;
+    const data     = `${userIdStr}.${ts}`;
+    const expected = createHmac("sha256", JWT_SECRET).update(data).digest("hex").slice(0, 16);
+    if (sig !== expected) return null;
+    if (Date.now() - parseInt(ts) > 10 * 60 * 1000) return null;
+    return parseInt(userIdStr, 10);
+  } catch { return null; }
+}
+
+/** Exchange a refresh_token for a new access_token; store & return the new token */
+async function refreshYouTubeToken(userId: number, refreshToken: string): Promise<string | null> {
+  try {
+    const r = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id:     GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type:    "refresh_token",
+      }),
+    });
+    if (!r.ok) return null;
+    const data = await r.json() as any;
+    const accessToken = data.access_token as string;
+    if (!accessToken) return null;
+    const expiry = Date.now() + (data.expires_in ?? 3600) * 1000;
+    await getPool().execute(
+      "UPDATE settings SET yt_access_token=?, yt_token_expiry=? WHERE user_id=?",
+      [encryptCookie(accessToken), expiry, userId]
+    );
+    return accessToken;
+  } catch { return null; }
+}
+
+/**
+ * Returns a valid YouTube OAuth access_token for userId.
+ * Auto-refreshes if the current token has expired.
+ */
+async function getYouTubeAccessToken(userId: number): Promise<string> {
+  const rows = await query<any>(
+    "SELECT yt_access_token, yt_refresh_token, yt_token_expiry FROM settings WHERE user_id=?",
+    [userId]
+  );
+  const row = rows[0];
+  if (!row?.yt_access_token) throw new Error("Chưa kết nối tài khoản Google. Vào Cài đặt → Tài khoản YouTube.");
+
+  const accessEnc = row.yt_access_token as string;
+  const refreshEnc = row.yt_refresh_token as string | null;
+  const expiry     = Number(row.yt_token_expiry ?? 0);
+
+  // Still valid (with 60s buffer)
+  if (expiry > Date.now() + 60_000) {
+    const token = decryptCookie(accessEnc);
+    if (token) return token;
   }
+
+  // Try refresh
+  if (refreshEnc) {
+    const refreshToken = decryptCookie(refreshEnc);
+    if (refreshToken) {
+      const newToken = await refreshYouTubeToken(userId, refreshToken);
+      if (newToken) return newToken;
+    }
+  }
+
+  throw new Error("Phiên YouTube đã hết hạn. Vui lòng kết nối lại tài khoản Google trong Cài đặt.");
 }
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -424,6 +528,153 @@ app.get("/api/auth/user", optionalAuth, async (req, res) => {
   res.json(users[0]);
 });
 
+// ── Google OAuth 2.0 — YouTube Account ───────────────────────────────────────
+
+/**
+ * GET /api/auth/youtube
+ * Bắt đầu OAuth flow: redirect đến Google consent screen.
+ * JWT được đọc từ query param ?_token= (vì đây là redirect đơn thuần, không có header).
+ */
+app.get("/api/auth/youtube", async (req, res) => {
+  const tokenParam = req.query._token as string | undefined;
+  const authHeader = req.headers.authorization;
+  const rawToken = tokenParam || (authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null);
+  if (!rawToken) return res.status(401).json({ message: "Unauthorized" });
+  const payload = verifyToken(rawToken);
+  if (!payload) return res.status(401).json({ message: "Invalid token" });
+
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_REDIRECT_URI) {
+    return res.status(500).send(`
+      <html><body style="font-family:sans-serif;padding:2rem;">
+        <h2>⚠️ Chưa cấu hình Google OAuth</h2>
+        <p>Cần thêm <code>GOOGLE_CLIENT_ID</code> và <code>GOOGLE_REDIRECT_URI</code> vào biến môi trường.</p>
+        <p><a href="/settings">← Quay lại Cài đặt</a></p>
+      </body></html>
+    `);
+  }
+
+  const state = makeOAuthState(payload.userId);
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", GOOGLE_REDIRECT_URI);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", YOUTUBE_SCOPES);
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("prompt", "consent select_account");
+  url.searchParams.set("state", state);
+  res.redirect(url.toString());
+});
+
+/**
+ * GET /api/auth/youtube/callback
+ * Google redirect về đây sau khi user đồng ý.
+ * Exchange authorization code → access_token + refresh_token.
+ */
+app.get("/api/auth/youtube/callback", async (req, res) => {
+  const { code, state, error } = req.query as Record<string, string>;
+
+  if (error || !code || !state) {
+    return res.redirect(`/settings?youtube=error&reason=${encodeURIComponent(error || "missing_code")}`);
+  }
+
+  const userId = verifyOAuthState(state);
+  if (!userId) {
+    return res.redirect("/settings?youtube=error&reason=invalid_state");
+  }
+
+  try {
+    // Exchange code for tokens
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id:     GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri:  GOOGLE_REDIRECT_URI,
+        grant_type:    "authorization_code",
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      const errBody = await tokenRes.text();
+      console.error("[oauth] token exchange failed:", errBody);
+      return res.redirect("/settings?youtube=error&reason=token_exchange");
+    }
+
+    const tokens = await tokenRes.json() as any;
+    if (!tokens.access_token) {
+      return res.redirect("/settings?youtube=error&reason=no_access_token");
+    }
+
+    // Fetch Google account info (name/email for display)
+    let accountName = "";
+    try {
+      const profileRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+      });
+      if (profileRes.ok) {
+        const profile = await profileRes.json() as any;
+        accountName = profile.name || profile.email || "";
+      }
+    } catch { /* not critical */ }
+
+    const expiry = Date.now() + (tokens.expires_in ?? 3600) * 1000;
+
+    await getPool().execute(
+      `INSERT INTO settings
+         (user_id, yt_access_token, yt_refresh_token, yt_token_expiry, yt_account_name)
+       VALUES (?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE
+         yt_access_token=VALUES(yt_access_token),
+         yt_refresh_token=VALUES(yt_refresh_token),
+         yt_token_expiry=VALUES(yt_token_expiry),
+         yt_account_name=VALUES(yt_account_name)`,
+      [
+        userId,
+        encryptCookie(tokens.access_token),
+        tokens.refresh_token ? encryptCookie(tokens.refresh_token) : null,
+        expiry,
+        accountName,
+      ]
+    );
+
+    res.redirect("/settings?youtube=connected");
+  } catch (err: any) {
+    console.error("[oauth] callback error:", err.message);
+    res.redirect("/settings?youtube=error&reason=server_error");
+  }
+});
+
+/**
+ * GET /api/auth/youtube/status
+ * Trả về trạng thái kết nối YouTube OAuth.
+ */
+app.get("/api/auth/youtube/status", authMiddleware, async (req, res) => {
+  const { userId } = (req as any).user;
+  const rows = await query<any>(
+    "SELECT yt_access_token, yt_account_name FROM settings WHERE user_id=?",
+    [userId]
+  );
+  res.json({
+    connected:   !!rows[0]?.yt_access_token,
+    accountName: rows[0]?.yt_account_name || "",
+  });
+});
+
+/**
+ * DELETE /api/auth/youtube
+ * Ngắt kết nối: xóa tokens khỏi DB.
+ */
+app.delete("/api/auth/youtube", authMiddleware, async (req, res) => {
+  const { userId } = (req as any).user;
+  await getPool().execute(
+    "UPDATE settings SET yt_access_token=NULL, yt_refresh_token=NULL, yt_token_expiry=0, yt_account_name=NULL WHERE user_id=?",
+    [userId]
+  );
+  res.json({ ok: true });
+});
+
 // ── Proxy pass-through ────────────────────────────────────────────────────────
 app.get("/api/proxy", async (req, res) => {
   const targetUrl = req.query.url as string;
@@ -605,12 +856,35 @@ app.get("/api/yt/stream/:id", async (req, res) => {
 });
 
 // ── YouTube: comments ─────────────────────────────────────────────────────────
+// ── YouTube: comments (YouTube Data API v3 — public, no auth needed) ──────────
 app.get("/api/yt/comments/:id", async (req, res) => {
   try {
-    const yt = await getYoutube();
-    const comments = await yt.getComments(req.params.id);
-    res.json(comments.contents.map((c:any)=>{ try { return { id:c.comment_id||String(Math.random()), author:c.author?.name||"Unknown", authorThumbnail:c.author?.thumbnails?.[0]?.url||"", text:c.content?.text||"", publishedTime:c.published?.text||"", likeCount:c.vote_count?.text||"0", replyCount:c.reply_count||0 }; } catch { return null; } }).filter(Boolean));
-  } catch { res.json([]); }
+    const apiKey = process.env.YOUTUBE_API_KEY;
+    if (!apiKey) return res.json([]);
+    const { pageToken, maxResults = "30" } = req.query as any;
+    const url = new URL("https://www.googleapis.com/youtube/v3/commentThreads");
+    url.searchParams.set("part", "snippet");
+    url.searchParams.set("videoId", req.params.id);
+    url.searchParams.set("maxResults", maxResults);
+    url.searchParams.set("key", apiKey);
+    url.searchParams.set("order", "relevance");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const r = await fetch(url.toString());
+    if (!r.ok) return res.json([]);
+    const data = await r.json() as any;
+    res.json({
+      items: (data.items || []).map((item: any) => ({
+        id: item.id,
+        author: item.snippet.topLevelComment.snippet.authorDisplayName,
+        authorThumbnail: item.snippet.topLevelComment.snippet.authorProfileImageUrl,
+        text: item.snippet.topLevelComment.snippet.textDisplay,
+        publishedTime: item.snippet.topLevelComment.snippet.publishedAt,
+        likeCount: String(item.snippet.topLevelComment.snippet.likeCount),
+        replyCount: item.snippet.totalReplyCount,
+      })),
+      nextPageToken: data.nextPageToken || null,
+    });
+  } catch { res.json({ items: [], nextPageToken: null }); }
 });
 
 // ── YouTube: channel ──────────────────────────────────────────────────────────
@@ -1020,47 +1294,35 @@ app.delete("/api/history", authMiddleware, async (req, res) => {
 // ── Settings (auth required) ──────────────────────────────────────────────────
 
 // ── YouTube cookie (save encrypted / delete) ──────────────────────────────────
-app.post("/api/settings/yt-cookie", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { cookie } = z.object({ cookie: z.string().min(10) }).parse(req.body);
-    const encrypted = encryptCookie(cookie.trim());
-    await getPool().execute(
-      "INSERT INTO settings (user_id, yt_cookie) VALUES (?,?) ON DUPLICATE KEY UPDATE yt_cookie=VALUES(yt_cookie)",
-      [userId, encrypted]
-    );
-    res.json({ ok: true });
-  } catch (err: any) {
-    if (err instanceof z.ZodError) return res.status(400).json({ message: "Invalid cookie" });
-    console.error("Save cookie:", err.message);
-    res.status(500).json({ message: "Failed to save cookie" });
-  }
+// ── Backward-compat shims (yt-cookie → OAuth) ────────────────────────────────
+// Kept so existing clients don't break during transition.
+app.post("/api/settings/yt-cookie", authMiddleware, async (_req, res) => {
+  res.status(400).json({ message: "Cookie không còn được hỗ trợ. Vui lòng dùng Kết nối tài khoản Google trong Cài đặt." });
 });
 
 app.delete("/api/settings/yt-cookie", authMiddleware, async (req, res) => {
+  // Delegate to new OAuth disconnect
   const { userId } = (req as any).user;
-  await getPool().execute("UPDATE settings SET yt_cookie=NULL WHERE user_id=?", [userId]);
+  await getPool().execute(
+    "UPDATE settings SET yt_access_token=NULL, yt_refresh_token=NULL, yt_token_expiry=0, yt_account_name=NULL WHERE user_id=?",
+    [userId]
+  );
   res.json({ ok: true });
 });
 
 app.get("/api/settings/yt-cookie/status", authMiddleware, async (req, res) => {
+  // Redirect to new status endpoint response format (hasCookie kept for compat)
   const { userId } = (req as any).user;
-  const rows = await query<any>("SELECT yt_cookie IS NOT NULL AS has_cookie FROM settings WHERE user_id=?", [userId]);
-  res.json({ hasCookie: !!rows[0]?.has_cookie });
+  const rows = await query<any>("SELECT yt_access_token FROM settings WHERE user_id=?", [userId]);
+  const connected = !!rows[0]?.yt_access_token;
+  res.json({ hasCookie: connected, connected });
 });
 
-// ── YouTube authenticated actions (like, dislike, subscribe, comment) ─────────
 // ── YouTube Data API v3 — authenticated interactions ─────────────────────────
-// These use the user's OAuth access token (stored as yt_cookie in DB but
-// interpreted as an OAuth token for the Data API v3 endpoints).
-// Users obtain a token via Google OAuth consent screen and paste it in Settings.
 
 async function ytDataApi(userId: number, path: string, method = "POST", body?: any): Promise<any> {
-  const rows = await query<any>("SELECT yt_cookie FROM settings WHERE user_id=?", [userId]);
-  const enc = rows[0]?.yt_cookie;
-  if (!enc) throw new Error("No YouTube token. Add your OAuth token in Settings.");
-  const token = decryptCookie(enc);
-  if (!token) throw new Error("Could not decrypt YouTube token.");
+  // getYouTubeAccessToken handles token retrieval, expiry check and refresh automatically
+  const token = await getYouTubeAccessToken(userId);
 
   const url = `https://www.googleapis.com/youtube/v3${path}`;
   const res = await fetch(url, {

@@ -45,11 +45,11 @@ export default function VideoPage() {
   const { data: related } = useSearch(video?.title || "trending", "video");
   const { data: channel } = useChannel(video?.channelId || "");
 
-  // Check if user has YT OAuth token
+  // Check if user has YT OAuth token (Google account connected)
   useEffect(() => {
     if (!isAuthenticated) return;
-    fetch("/api/settings/yt-cookie/status", { headers: authHeaders() })
-      .then(r => r.json()).then(d => setHasCookie(!!d.hasCookie)).catch(() => {});
+    fetch("/api/auth/youtube/status", { headers: authHeaders() })
+      .then(r => r.json()).then(d => setHasCookie(!!d.connected)).catch(() => {});
   }, [isAuthenticated]);
 
   // Load real like + subscribe status from YouTube Data API v3
@@ -133,7 +133,7 @@ export default function VideoPage() {
   // YT Like / Dislike
   const handleYtLike = async (action: "like" | "dislike") => {
     if (!hasCookie || !isAuthenticated) {
-      toast({ title: "Cần đăng nhập YouTube", description: "Thêm cookie YouTube trong Cài đặt.", variant: "destructive" });
+      toast({ title: "Cần kết nối tài khoản Google", description: "Vào Cài đặt → Tài khoản YouTube → Kết nối.", variant: "destructive" });
       return;
     }
     try {
@@ -153,7 +153,7 @@ export default function VideoPage() {
   // YT Subscribe
   const handleSubscribe = async () => {
     if (!hasCookie || !isAuthenticated || !video?.channelId) {
-      toast({ title: "Cần đăng nhập YouTube", description: "Thêm cookie YouTube trong Cài đặt.", variant: "destructive" });
+      toast({ title: "Cần kết nối tài khoản Google", description: "Vào Cài đặt → Tài khoản YouTube → Kết nối.", variant: "destructive" });
       return;
     }
     try {
@@ -168,7 +168,7 @@ export default function VideoPage() {
   const submitComment = async () => {
     if (!commentText.trim()) return;
     if (!hasCookie || !isAuthenticated) {
-      toast({ title: "Cần đăng nhập YouTube", description: "Thêm cookie YouTube trong Cài đặt.", variant: "destructive" });
+      toast({ title: "Cần kết nối tài khoản Google", description: "Vào Cài đặt → Tài khoản YouTube → Kết nối.", variant: "destructive" });
       return;
     }
     setSubmittingComment(true);
@@ -317,7 +317,7 @@ export default function VideoPage() {
           {showComment && (
             <div className="bg-secondary/30 rounded-xl p-4 space-y-3">
               <p className="text-sm font-semibold">
-                {hasCookie ? "Viết bình luận YouTube" : "⚠️ Cần cookie YouTube (Cài đặt → YouTube)"}
+                {hasCookie ? "Viết bình luận YouTube" : "⚠️ Cần kết nối tài khoản Google (Cài đặt → Tài khoản YouTube)"}
               </p>
               <textarea
                 className="w-full bg-background border border-border rounded-lg p-3 text-sm resize-none focus:outline-none focus:ring-1 focus:ring-primary/50"

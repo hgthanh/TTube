@@ -38,9 +38,9 @@ export default function Settings() {
   // Prevent saveSettings from firing during initial data load
   const initialized = useRef(false);
 
-  const [ytCookie, setYtCookie] = useState("");
   const [hasCookie, setHasCookie] = useState(false);
-  const [savingCookie, setSavingCookie] = useState(false);
+  const [ytAccountName, setYtAccountName] = useState("");
+  const [connectingYt, setConnectingYt] = useState(false);
   const { permission, subscribed, loading: pushLoading, subscribe: subscribePush, unsubscribe: unsubscribePush } = usePushNotifications(authHeaders);
   const [lanDeviceName, setLanDeviceName] = useState(
     () => localStorage.getItem("lan_device_name") || ""
@@ -79,11 +79,25 @@ export default function Settings() {
     }
   };
 
-  // Load YT cookie status
+  // Load YouTube OAuth status
   useEffect(() => {
     if (!isAuthenticated) return;
-    fetch("/api/settings/yt-cookie/status", { headers: authHeaders() })
-      .then(r => r.json()).then(d => setHasCookie(!!d.hasCookie)).catch(() => {});
+    fetch("/api/auth/youtube/status", { headers: authHeaders() })
+      .then(r => r.json())
+      .then(d => { setHasCookie(!!d.connected); setYtAccountName(d.accountName || ""); })
+      .catch(() => {});
+
+    // Handle redirect-back query params after OAuth flow
+    const params = new URLSearchParams(window.location.search);
+    const ytStatus = params.get("youtube");
+    if (ytStatus === "connected") {
+      toast({ title: "✅ Đã kết nối tài khoản Google", description: "Bạn có thể Like, Subscribe, Bình luận trên YouTube." });
+      window.history.replaceState({}, "", "/settings");
+    } else if (ytStatus === "error") {
+      const reason = params.get("reason") || "unknown";
+      toast({ title: "Kết nối thất bại", description: `Lỗi: ${reason}. Vui lòng thử lại.`, variant: "destructive" });
+      window.history.replaceState({}, "", "/settings");
+    }
   }, [isAuthenticated]);
 
   // Load settings from API if authenticated, else localStorage
@@ -362,64 +376,77 @@ export default function Settings() {
           </CardHeader>
           <CardContent className="space-y-4">
             <p className="text-sm text-muted-foreground">
-              Đăng nhập bằng cookie để sử dụng Like, Dislike, Đăng ký, Bình luận.
-              Cookie được mã hóa AES-256 trước khi lưu.
+              Kết nối tài khoản Google để dùng Like, Dislike, Đăng ký kênh và Bình luận trực tiếp trên YouTube.
+              Token OAuth 2.0 được mã hóa AES-256 trước khi lưu.
             </p>
 
             {hasCookie ? (
-              <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/20 rounded-xl">
-                <CheckCircle2 className="h-5 w-5 text-green-500 shrink-0" />
-                <div className="flex-1">
-                  <p className="text-sm font-semibold text-green-400">Cookie đã được lưu</p>
-                  <p className="text-xs text-muted-foreground">Bạn có thể Like, Dislike, Subscribe, Comment.</p>
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/20 rounded-xl">
+                  <CheckCircle2 className="h-5 w-5 text-green-500 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-green-400">Đã kết nối tài khoản Google</p>
+                    {ytAccountName && (
+                      <p className="text-xs text-muted-foreground truncate">{ytAccountName}</p>
+                    )}
+                    <p className="text-xs text-muted-foreground">Bạn có thể Like, Dislike, Subscribe, Comment.</p>
+                  </div>
                 </div>
-                <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive gap-1"
-                  onClick={async () => {
-                    await fetch("/api/settings/yt-cookie", { method: "DELETE", headers: authHeaders() });
-                    setHasCookie(false);
-                    toast({ title: "Đã xóa cookie" });
-                  }}>
-                  <Trash2 className="h-4 w-4" /> Xóa
-                </Button>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 gap-2"
+                    disabled={connectingYt || !isAuthenticated}
+                    onClick={async () => {
+                      setConnectingYt(true);
+                      const token = (authHeaders() as any)["Authorization"]?.replace("Bearer ", "");
+                      window.location.href = `/api/auth/youtube?_token=${encodeURIComponent(token || "")}`;
+                    }}
+                  >
+                    <RefreshCw className="h-4 w-4" /> Kết nối lại
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="flex-1 text-destructive hover:text-destructive gap-2"
+                    onClick={async () => {
+                      await fetch("/api/auth/youtube", { method: "DELETE", headers: authHeaders() });
+                      setHasCookie(false);
+                      setYtAccountName("");
+                      toast({ title: "Đã ngắt kết nối tài khoản Google" });
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" /> Ngắt kết nối
+                  </Button>
+                </div>
               </div>
             ) : (
               <div className="space-y-3">
-                <div>
-                  <Label className="font-medium text-sm">Cookie từ youtube.com</Label>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    Mở F12 → Network → Chọn request tới youtube.com → Copy header <code className="bg-muted px-1 rounded">Cookie</code>
-                  </p>
+                <div className="p-3 bg-secondary/50 border border-border rounded-xl text-sm text-muted-foreground space-y-1">
+                  <p className="font-medium text-foreground">Cách thức hoạt động:</p>
+                  <p>1. Nhấn nút bên dưới → trang Google hiện ra</p>
+                  <p>2. Chọn tài khoản Google của bạn → Cấp quyền</p>
+                  <p>3. Tự động quay về Cài đặt — xong!</p>
                 </div>
-                <textarea
-                  className="w-full h-24 px-3 py-2 text-xs bg-secondary border border-border rounded-lg resize-none focus:outline-none focus:ring-1 focus:ring-primary/50 font-mono"
-                  placeholder="Dán cookie vào đây..."
-                  value={ytCookie}
-                  onChange={e => setYtCookie(e.target.value)}
-                />
                 <Button
                   className="w-full gap-2"
-                  disabled={!ytCookie.trim() || savingCookie || !isAuthenticated}
+                  disabled={connectingYt || !isAuthenticated}
                   onClick={async () => {
-                    setSavingCookie(true);
+                    setConnectingYt(true);
                     try {
-                      const res = await fetch("/api/settings/yt-cookie", {
-                        method: "POST",
-                        headers: { ...authHeaders(), "Content-Type": "application/json" },
-                        body: JSON.stringify({ cookie: ytCookie.trim() }),
-                      });
-                      if (res.ok) {
-                        setHasCookie(true);
-                        setYtCookie("");
-                        toast({ title: "✅ Đã lưu cookie", description: "Cookie được mã hóa và lưu an toàn." });
-                      } else {
-                        const d = await res.json();
-                        toast({ title: "Lỗi: " + (d.message || "Thất bại"), variant: "destructive" });
-                      }
-                    } catch { toast({ title: "Lỗi kết nối", variant: "destructive" }); }
-                    setSavingCookie(false);
+                      const token = (authHeaders() as any)["Authorization"]?.replace("Bearer ", "");
+                      window.location.href = `/api/auth/youtube?_token=${encodeURIComponent(token || "")}`;
+                    } catch {
+                      setConnectingYt(false);
+                      toast({ title: "Lỗi kết nối", variant: "destructive" });
+                    }
                   }}
                 >
-                  {savingCookie ? <><Loader2 className="h-4 w-4 animate-spin" /> Đang lưu...</> : <><Check className="h-4 w-4" /> Lưu cookie</>}
+                  {connectingYt
+                    ? <><Loader2 className="h-4 w-4 animate-spin" /> Đang chuyển hướng...</>
+                    : <><LogIn className="h-4 w-4" /> Kết nối tài khoản Google</>
+                  }
                 </Button>
                 {!isAuthenticated && (
                   <p className="text-xs text-muted-foreground text-center">Cần đăng nhập tài khoản TTube trước.</p>

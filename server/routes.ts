@@ -406,31 +406,41 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  // ── YouTube: comments ─────────────────────────────────────────────────────
+  // ── YouTube: comments (YouTube Data API v3 — public) ──────────────────────
   app.get(api.yt.comments.path, async (req, res) => {
     try {
       const { id } = req.params;
-      const yt = await getYoutube();
-      const comments = await yt.getComments(id);
+      const apiKey = process.env.YOUTUBE_API_KEY;
+      if (!apiKey) return res.json({ items: [], nextPageToken: null });
 
-      const mapped = comments.contents.map((c: any) => {
-        try {
-          return {
-            id: c.comment_id || c.commentId || String(Math.random()),
-            author: c.author?.name || "Unknown",
-            authorThumbnail: c.author?.thumbnails?.[0]?.url || "",
-            text: c.content?.text || "",
-            publishedTime: c.published?.text || "",
-            likeCount: c.vote_count?.text || "0",
-            replyCount: c.reply_count || 0,
-          };
-        } catch { return null; }
-      }).filter(Boolean);
+      const { pageToken, maxResults = "30" } = req.query as any;
+      const url = new URL("https://www.googleapis.com/youtube/v3/commentThreads");
+      url.searchParams.set("part", "snippet");
+      url.searchParams.set("videoId", id);
+      url.searchParams.set("maxResults", maxResults);
+      url.searchParams.set("key", apiKey);
+      url.searchParams.set("order", "relevance");
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
 
-      res.json(mapped);
+      const r = await fetch(url.toString());
+      if (!r.ok) return res.json({ items: [], nextPageToken: null });
+      const data = await r.json() as any;
+
+      res.json({
+        items: (data.items || []).map((item: any) => ({
+          id: item.id,
+          author: item.snippet.topLevelComment.snippet.authorDisplayName,
+          authorThumbnail: item.snippet.topLevelComment.snippet.authorProfileImageUrl,
+          text: item.snippet.topLevelComment.snippet.textDisplay,
+          publishedTime: item.snippet.topLevelComment.snippet.publishedAt,
+          likeCount: String(item.snippet.topLevelComment.snippet.likeCount),
+          replyCount: item.snippet.totalReplyCount,
+        })),
+        nextPageToken: data.nextPageToken || null,
+      });
     } catch (err: any) {
       console.error("Comments error:", err.message);
-      res.json([]);
+      res.json({ items: [], nextPageToken: null });
     }
   });
 
