@@ -185,6 +185,19 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        {/* Footer — required for Google OAuth branding verification */}
+        <footer className="mt-16 pb-8 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-xs text-muted-foreground/60">
+          <Link href="/privacy" className="hover:text-muted-foreground transition-colors underline-offset-2 hover:underline">
+            Chính sách quyền riêng tư
+          </Link>
+          <span>·</span>
+          <Link href="/terms" className="hover:text-muted-foreground transition-colors underline-offset-2 hover:underline">
+            Điều khoản sử dụng
+          </Link>
+          <span>·</span>
+          <span>© {new Date().getFullYear()} TTube</span>
+        </footer>
       </div>
     </Layout>
   );
