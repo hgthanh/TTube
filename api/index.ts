@@ -1050,64 +1050,158 @@ app.get("/api/settings/yt-cookie/status", authMiddleware, async (req, res) => {
 });
 
 // ── YouTube authenticated actions (like, dislike, subscribe, comment) ─────────
+// ── YouTube Data API v3 — authenticated interactions ─────────────────────────
+// These use the user's OAuth access token (stored as yt_cookie in DB but
+// interpreted as an OAuth token for the Data API v3 endpoints).
+// Users obtain a token via Google OAuth consent screen and paste it in Settings.
+
+async function ytDataApi(userId: number, path: string, method = "POST", body?: any): Promise<any> {
+  const rows = await query<any>("SELECT yt_cookie FROM settings WHERE user_id=?", [userId]);
+  const enc = rows[0]?.yt_cookie;
+  if (!enc) throw new Error("No YouTube token. Add your OAuth token in Settings.");
+  const token = decryptCookie(enc);
+  if (!token) throw new Error("Could not decrypt YouTube token.");
+
+  const url = `https://www.googleapis.com/youtube/v3${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (res.status === 204) return { ok: true };
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const msg = err?.error?.errors?.[0]?.message || err?.error?.message || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+// Like a video  (POST /videos/rate?id=<videoId>&rating=like)
 app.post("/api/yt/like/:videoId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const yt = await getYoutubeForUser(userId);
-    const info = await yt.getInfo(req.params.videoId);
-    await info.like();
+    await ytDataApi(userId, `/videos/rate?id=${req.params.videoId}&rating=like`, "POST");
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 
+// Dislike a video
 app.post("/api/yt/dislike/:videoId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const yt = await getYoutubeForUser(userId);
-    const info = await yt.getInfo(req.params.videoId);
-    await info.dislike();
+    await ytDataApi(userId, `/videos/rate?id=${req.params.videoId}&rating=dislike`, "POST");
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 
+// Remove rating (unlike/undislike)
 app.delete("/api/yt/like/:videoId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const yt = await getYoutubeForUser(userId);
-    const info = await yt.getInfo(req.params.videoId);
-    await info.removeLike();
+    await ytDataApi(userId, `/videos/rate?id=${req.params.videoId}&rating=none`, "POST");
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 
+// Get user's current rating for a video
+app.get("/api/yt/like/:videoId/status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const data = await ytDataApi(userId, `/videos/getRating?id=${req.params.videoId}`, "GET");
+    const rating = data?.items?.[0]?.rating || "none"; // "like" | "dislike" | "none"
+    res.json({ rating });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+// Subscribe to a channel
 app.post("/api/yt/subscribe/:channelId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const yt = await getYoutubeForUser(userId);
-    const ch = await yt.getChannel(req.params.channelId);
-    await (ch as any).subscribe();
+    await ytDataApi(userId, "/subscriptions?part=snippet", "POST", {
+      snippet: { resourceId: { kind: "youtube#channel", channelId: req.params.channelId } },
+    });
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 
+// Unsubscribe — first fetch subscriptionId, then delete
 app.delete("/api/yt/subscribe/:channelId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const yt = await getYoutubeForUser(userId);
-    const ch = await yt.getChannel(req.params.channelId);
-    await (ch as any).unsubscribe();
+    // Find the subscriptionId for this channel
+    const listData = await ytDataApi(
+      userId,
+      `/subscriptions?part=id&mine=true&forChannelId=${req.params.channelId}&maxResults=1`,
+      "GET"
+    );
+    const subId = listData?.items?.[0]?.id;
+    if (!subId) return res.status(404).json({ message: "Subscription not found" });
+    await ytDataApi(userId, `/subscriptions?id=${subId}`, "DELETE");
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 
+// Check subscription status
+app.get("/api/yt/subscribe/:channelId/status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const data = await ytDataApi(
+      userId,
+      `/subscriptions?part=id&mine=true&forChannelId=${req.params.channelId}&maxResults=1`,
+      "GET"
+    );
+    res.json({ subscribed: (data?.items?.length ?? 0) > 0 });
+  } catch (err: any) { res.status(500).json({ subscribed: false, message: err.message }); }
+});
+
+// Post a comment
 app.post("/api/yt/comment/:videoId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { text } = z.object({ text: z.string().min(1).max(2000) }).parse(req.body);
-    const yt = await getYoutubeForUser(userId);
-    const info = await yt.getInfo(req.params.videoId);
-    await (info as any).comment(text);
-    res.json({ ok: true });
+    const { text } = z.object({ text: z.string().min(1).max(10000) }).parse(req.body);
+    const data = await ytDataApi(userId, "/commentThreads?part=snippet", "POST", {
+      snippet: {
+        videoId: req.params.videoId,
+        topLevelComment: { snippet: { textOriginal: text } },
+      },
+    });
+    res.json({ ok: true, commentId: data?.id });
+  } catch (err: any) { res.status(500).json({ message: err.message }); }
+});
+
+// Get comments for a video (public, no auth needed)
+app.get("/api/yt/comments/v3/:videoId", async (req, res) => {
+  try {
+    const apiKey = process.env.YOUTUBE_API_KEY;
+    if (!apiKey) return res.status(500).json({ message: "YOUTUBE_API_KEY not set" });
+    const { pageToken, maxResults = "20" } = req.query as any;
+    const url = new URL("https://www.googleapis.com/youtube/v3/commentThreads");
+    url.searchParams.set("part", "snippet");
+    url.searchParams.set("videoId", req.params.videoId);
+    url.searchParams.set("maxResults", maxResults);
+    url.searchParams.set("key", apiKey);
+    url.searchParams.set("order", "relevance");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const r = await fetch(url.toString());
+    const data = await r.json();
+    res.json({
+      items: (data.items || []).map((item: any) => ({
+        id: item.id,
+        author: item.snippet.topLevelComment.snippet.authorDisplayName,
+        authorThumbnail: item.snippet.topLevelComment.snippet.authorProfileImageUrl,
+        text: item.snippet.topLevelComment.snippet.textDisplay,
+        publishedTime: item.snippet.topLevelComment.snippet.publishedAt,
+        likeCount: String(item.snippet.topLevelComment.snippet.likeCount),
+        replyCount: item.snippet.totalReplyCount,
+      })),
+      nextPageToken: data.nextPageToken || null,
+    });
   } catch (err: any) { res.status(500).json({ message: err.message }); }
 });
 

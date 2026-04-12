@@ -8,10 +8,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useVideo, useStreamUrl, useSearch, useChannel } from "@/hooks/use-yt";
 import { useAuth } from "@/contexts/AuthContext";
 import { useLang } from "@/contexts/LangContext";
-import { Share2, Heart, Headphones, Wifi, ThumbsUp, ThumbsDown, Bell, MessageCircle, Send } from "lucide-react";
+import { Share2, Heart, Headphones, Wifi, ThumbsUp, ThumbsDown, Bell, MessageCircle, Send, Tv2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANShareDialog } from "@/components/video/LANShare";
 import { useToast } from "@/hooks/use-toast";
+import { useChromecast } from "@/hooks/useChromecast";
+import { CastButton } from "@/components/video/CastButton";
 
 export default function VideoPage() {
   const [match, params] = useRoute("/watch/:id");
@@ -35,17 +37,51 @@ export default function VideoPage() {
   const { isAuthenticated, authHeaders } = useAuth();
   const { t } = useLang();
 
+  // Chromecast
+  const { available: castAvailable, castState, deviceName: castDeviceName, startCast, stopCast, loadMedia: castLoadMedia, connected: castConnected } = useChromecast();
+
   const { data: video, isLoading: loadingVideo } = useVideo(id);
   const { data: streamUrl, isLoading: loadingStream } = useStreamUrl(id);
   const { data: related } = useSearch(video?.title || "trending", "video");
   const { data: channel } = useChannel(video?.channelId || "");
 
-  // Check if user has YT cookie (for authenticated actions)
+  // Check if user has YT OAuth token
   useEffect(() => {
     if (!isAuthenticated) return;
     fetch("/api/settings/yt-cookie/status", { headers: authHeaders() })
       .then(r => r.json()).then(d => setHasCookie(!!d.hasCookie)).catch(() => {});
   }, [isAuthenticated]);
+
+  // Load real like + subscribe status from YouTube Data API v3
+  useEffect(() => {
+    if (!isAuthenticated || !hasCookie || !id) return;
+    // Like status
+    fetch(`/api/yt/like/${id}/status`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(d => {
+        if (d.rating === "like") setYtLike("like");
+        else if (d.rating === "dislike") setYtLike("dislike");
+        else setYtLike(null);
+      }).catch(() => {});
+  }, [isAuthenticated, hasCookie, id]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !hasCookie || !video?.channelId) return;
+    // Subscribe status
+    fetch(`/api/yt/subscribe/${video.channelId}/status`, { headers: authHeaders() })
+      .then(r => r.json())
+      .then(d => setYtSubscribed(!!d.subscribed))
+      .catch(() => {});
+  }, [isAuthenticated, hasCookie, video?.channelId]);
+
+  // Auto-cast when cast session connects and we have a stream
+  const { data: streamUrl } = { data: null as string | null | undefined }; // placeholder ref
+  useEffect(() => {
+    if (!castConnected) return;
+    const su = (window as any).__ttube_stream_url;
+    if (!su) return;
+    castLoadMedia({ url: su, title: video?.title || "Video", thumbnail: video?.thumbnail, contentType: "video/mp4" }).catch(() => {});
+  }, [castConnected]);
 
   // Check favorite
   useEffect(() => {
@@ -257,6 +293,20 @@ export default function VideoPage() {
                 onClick={() => setLanShareOpen(true)}>
                 <Wifi className="w-4 h-4" /> LAN P2P
               </Button>
+
+              {/* Chromecast */}
+              {castAvailable && (
+                <div className="flex items-center">
+                  <CastButton
+                    castState={castState}
+                    deviceName={castDeviceName}
+                    available={castAvailable}
+                    onStart={startCast}
+                    onStop={stopCast}
+                    className="border border-border rounded-full px-2 h-9"
+                  />
+                </div>
+              )}
 
               {lanShareOpen && (
                 <LANShareDialog videoUrl={lanUrl} videoTitle={video?.title} onClose={() => setLanShareOpen(false)} />

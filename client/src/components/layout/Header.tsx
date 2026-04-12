@@ -17,6 +17,7 @@ export function Header({ toggleSidebar, isSidebarOpen }: HeaderProps) {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const suggestTimer = useRef<ReturnType<typeof setTimeout>>();
+  const composingRef = useRef(false); // track IME composition (Vietnamese, CJK)
   const { user, isAuthenticated, logout } = useAuth();
   const { t, lang, setLang } = useLang();
 
@@ -64,10 +65,22 @@ export function Header({ toggleSidebar, isSidebarOpen }: HeaderProps) {
         <div className="relative group">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground group-focus-within:text-primary transition-colors" />
           <input
-            type="search" placeholder={t.searchPlaceholder}
+            type="text"
+            placeholder={t.searchPlaceholder}
             className="w-full h-10 pl-10 pr-4 rounded-full bg-secondary border-none focus:ring-2 focus:ring-primary/50 transition-all placeholder:text-muted-foreground/50 text-sm"
             value={searchQuery}
-            onChange={e => { setSearchQuery(e.target.value); setShowSuggestions(true); }}
+            onChange={e => {
+              setSearchQuery(e.target.value);
+              // Only trigger suggestions after IME composition is complete
+              if (!composingRef.current) setShowSuggestions(true);
+            }}
+            onCompositionStart={() => { composingRef.current = true; }}
+            onCompositionEnd={e => {
+              composingRef.current = false;
+              // After IME commits (e.g. Vietnamese tone marks), update the value
+              setSearchQuery((e.target as HTMLInputElement).value);
+              setShowSuggestions(true);
+            }}
             onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
             onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
           />
