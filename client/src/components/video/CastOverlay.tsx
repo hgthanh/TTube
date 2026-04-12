@@ -3,7 +3,7 @@
  * Displays the video thumbnail, cast device name, and playback controls
  * that control the remote session.
  */
-import { Play, Pause, Volume2, Maximize } from "lucide-react";
+import { Play, Pause, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { CastButton } from "./CastButton";

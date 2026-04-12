@@ -113,7 +113,7 @@ export function Header({ toggleSidebar, isSidebarOpen }: HeaderProps) {
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" size="sm" className="gap-2">
                 <div className="w-7 h-7 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-xs">
-                  {user?.username[0].toUpperCase()}
+                  {user?.username?.[0]?.toUpperCase()}
                 </div>
                 <span className="hidden sm:block text-sm font-medium">{user?.username}</span>
               </Button>
